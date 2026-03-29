@@ -1,0 +1,90 @@
+[
+  {
+    "id": "hello_world",
+    "prompt": "Create a C++ hello world program in {workdir}/hello.cpp and a GNUmakefile to compile it to an executable called hello",
+    "expected_files": [
+      "{workdir}/hello.cpp",
+      "{workdir}/GNUmakefile"
+    ],
+    "expected_contents": {
+      "{workdir}/hello.cpp": {
+        "contains": ["#include", "int main", "Hello", "cout", "return 0"]
+      },
+      "{workdir}/GNUmakefile": {
+        "contains": ["hello", "g++", "clean"]
+      }
+    }
+  },
+  {
+    "id": "add_function",
+    "prompt": "Create a C++ file {workdir}/add.cpp with a function int add(int a, int b) that returns a + b, and a main() that prints add(3, 5). Include a GNUmakefile to compile it.",
+    "expected_files": [
+      "{workdir}/add.cpp",
+      "{workdir}/GNUmakefile"
+    ],
+    "expected_contents": {
+      "{workdir}/add.cpp": {
+        "contains": ["int add", "int a", "int b", "return a + b", "int main", "add(3", "5)"]
+      },
+      "{workdir}/GNUmakefile": {
+        "contains": ["g++", "add"]
+      }
+    }
+  },
+  {
+    "id": "header_and_source",
+    "prompt": "Create a C++ project in {workdir}/ with: math_utils.h declaring int factorial(int n), math_utils.cpp implementing it, main.cpp that prints factorial(5), and a GNUmakefile that compiles and links them into an executable called mathapp",
+    "expected_files": [
+      "{workdir}/math_utils.h",
+      "{workdir}/math_utils.cpp",
+      "{workdir}/main.cpp",
+      "{workdir}/GNUmakefile"
+    ],
+    "expected_contents": {
+      "{workdir}/math_utils.h": {
+        "contains": ["int factorial", "#ifndef", "#define", "#endif"]
+      },
+      "{workdir}/math_utils.cpp": {
+        "contains": ["#include", "math_utils.h", "int factorial", "return"]
+      },
+      "{workdir}/main.cpp": {
+        "contains": ["#include", "math_utils.h", "int main", "factorial(5)"]
+      },
+      "{workdir}/GNUmakefile": {
+        "contains": ["g++", "math_utils", "main", "mathapp"]
+      }
+    }
+  },
+  {
+    "id": "class_rectangle",
+    "prompt": "Create a C++ file {workdir}/rectangle.cpp with a class Rectangle that has width and height members, a constructor, and an int area() method. In main(), create a Rectangle(4, 7) and print its area. Include a GNUmakefile.",
+    "expected_files": [
+      "{workdir}/rectangle.cpp",
+      "{workdir}/GNUmakefile"
+    ],
+    "expected_contents": {
+      "{workdir}/rectangle.cpp": {
+        "contains": ["class Rectangle", "width", "height", "area()", "int main", "4", "7"]
+      },
+      "{workdir}/GNUmakefile": {
+        "contains": ["g++", "rectangle"]
+      }
+    }
+  },
+  {
+    "id": "fizzbuzz",
+    "prompt": "Create a C++ file {workdir}/fizzbuzz.cpp that prints FizzBuzz from 1 to 30. Print Fizz for multiples of 3, Buzz for multiples of 5, FizzBuzz for both, otherwise the number. Include a GNUmakefile.",
+    "expected_files": [
+      "{workdir}/fizzbuzz.cpp",
+      "{workdir}/GNUmakefile"
+    ],
+    "expected_contents": {
+      "{workdir}/fizzbuzz.cpp": {
+        "contains": ["int main", "Fizz", "Buzz", "FizzBuzz", "cout", "% 3", "% 5"]
+      },
+      "{workdir}/GNUmakefile": {
+        "contains": ["g++", "fizzbuzz"]
+      }
+    }
+  }
+]

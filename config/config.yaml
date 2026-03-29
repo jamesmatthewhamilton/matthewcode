@@ -1,0 +1,5 @@
+auto_approve: false
+max_iterations: 100
+max_bash_output: 30000
+verbose: false
+default_provider: default

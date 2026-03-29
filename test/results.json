@@ -1,0 +1,43 @@
+[
+  {
+    "id": "hello_world",
+    "status": "pass",
+    "failures": [],
+    "time": 42.026043176651
+  },
+  {
+    "id": "add_function",
+    "status": "fail",
+    "failures": [
+      "File missing: GNUmakefile"
+    ],
+    "time": 24.366508960723877
+  },
+  {
+    "id": "header_and_source",
+    "status": "fail",
+    "failures": [
+      "File missing: math_utils.h",
+      "File missing: math_utils.cpp",
+      "File missing: main.cpp",
+      "File missing: GNUmakefile"
+    ],
+    "time": 34.42811584472656
+  },
+  {
+    "id": "class_rectangle",
+    "status": "fail",
+    "failures": [
+      "File missing: GNUmakefile"
+    ],
+    "time": 28.645835161209106
+  },
+  {
+    "id": "fizzbuzz",
+    "status": "fail",
+    "failures": [
+      "File missing: GNUmakefile"
+    ],
+    "time": 28.076951026916504
+  }
+]
