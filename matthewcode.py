@@ -514,10 +514,22 @@ def main():
     print()
 
     max_iters = CONFIG.get("max_iterations", 10)
+    ctx_tokens = 0  # tracks prompt tokens from last LLM call
 
     while True:
         try:
-            user_input = input(f"{GREEN}>{RESET} ").strip()
+            if ctx_tokens > 0:
+                # Show token count in prompt
+                num_ctx = getattr(client, '_provider', None) and client._provider.config.get("num_ctx", 0) or 0
+                if num_ctx:
+                    pct = int(ctx_tokens / num_ctx * 100)
+                    ctx_color = RED if pct >= 90 else YELLOW if pct >= 70 else DIM
+                    ctx_info = f"{ctx_color}[{ctx_tokens}/{num_ctx} tokens]{RESET} "
+                else:
+                    ctx_info = f"{DIM}[{ctx_tokens} tokens]{RESET} "
+            else:
+                ctx_info = ""
+            user_input = input(f"{ctx_info}◗ ").strip()
         except (EOFError, KeyboardInterrupt):
             print(f"\n{DIM}Bye!{RESET}")
             break
@@ -616,12 +628,18 @@ def main():
 
                 full_content = ""
                 tool_calls = []
+                llama_frames = ["🦙      ", "  🦙    ", "    🦙  "]
+                frame_idx = 0
+                chunk_count = 0
                 for chunk in response:
                     if chunk.text:
                         full_content += chunk.text
-                        # Show a spinner/dot for responsiveness
-                        sys.stdout.write(".")
-                        sys.stdout.flush()
+                        chunk_count += 1
+                        if chunk_count % 3 == 0:  # animate every 3 chunks
+                            frame = llama_frames[frame_idx % len(llama_frames)]
+                            sys.stdout.write(f"\r{frame}")
+                            sys.stdout.flush()
+                            frame_idx += 1
                     if chunk.tool_calls:
                         tool_calls.extend(chunk.tool_calls)
 
@@ -631,9 +649,13 @@ def main():
                 if not tool_calls:
                     tool_calls = response.tool_calls
 
-                # Clear the dots and render the response
+                # Track context window usage (prompt_tokens = full input context)
+                if response.prompt_tokens:
+                    ctx_tokens = response.prompt_tokens
+
+                # Clear the llama animation and render the response
                 if full_content:
-                    sys.stdout.write("\r\033[K")  # clear the dots line
+                    sys.stdout.write("\r\033[K")  # clear the animation line
                     render_markdown(full_content)
 
                 # No native tool calls — try fallback text parsing
