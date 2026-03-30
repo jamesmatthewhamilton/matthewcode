@@ -742,13 +742,21 @@ def main():
                 # Add assistant message with tool calls
                 assistant_msg = {"role": "assistant", "content": full_content or ""}
                 assistant_msg["tool_calls"] = [
-                    {"id": f"call_{i}", "function": {"name": tc["name"], "arguments": tc["arguments"]}}
+                    {
+                        "id": f"call_{i}",
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": json.dumps(tc["arguments"]) if isinstance(tc["arguments"], dict) else tc["arguments"],
+                        },
+                    }
                     for i, tc in enumerate(tool_calls)
                 ]
                 messages.append(assistant_msg)
 
                 # Execute tool calls
-                for tc in tool_calls:
+                for i, tc in enumerate(tool_calls):
+                    call_id = f"call_{i}"
                     name = tc["name"]
                     tc_args = tc["arguments"]
                     if isinstance(tc_args, str):
@@ -761,14 +769,14 @@ def main():
 
                     if name not in SAFE_TOOLS and not args.yes:
                         if not confirm_tool(name, tc_args):
-                            messages.append({"role": "tool", "content": "User denied this action."})
+                            messages.append({"role": "tool", "tool_call_id": call_id, "content": "User rejected this action. Do NOT retry the same action. Ask the user what they want or try a different approach."})
                             continue
 
                     if name in TOOL_DISPATCH:
                         result = TOOL_DISPATCH[name](tc_args)
                     else:
                         result = f"Error: Unknown tool '{name}'"
-                    messages.append({"role": "tool", "content": result})
+                    messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
 
                     if args.verbose:
                         preview = result[:500] + ("..." if len(result) > 500 else "")
@@ -778,7 +786,14 @@ def main():
                 print(f"\n{DIM}(interrupted){RESET}")
                 break
             except Exception as e:
-                print(f"\n{RED}Error: {e}{RESET}")
+                err_str = str(e)
+                print(f"\n{RED}Error: {err_str}{RESET}")
+                # If it's a 400 bad request, the messages are malformed
+                # Remove messages back to the last user message to recover
+                if "400" in err_str or "bad request" in err_str.lower():
+                    while messages and messages[-1]["role"] != "user":
+                        messages.pop()
+                    print(f"{DIM}(removed bad messages from history to recover){RESET}")
                 break
         else:
             print(f"\n{YELLOW}(stopped after {max_iters} iterations){RESET}")
