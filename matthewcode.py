@@ -509,12 +509,19 @@ def main():
     if not messages:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
+    num_ctx = getattr(client, '_provider', None) and client._provider.config.get("num_ctx", 0) or 0
+    # Estimate tokens from loaded messages (~4 chars per token is a rough average)
+    total_chars = sum(len(str(m.get("content", ""))) for m in messages)
+    ctx_tokens = total_chars // 4
+    if num_ctx:
+        ctx_display = f"~{ctx_tokens}/{num_ctx} tokens (estimated)"
+    else:
+        ctx_display = f"~{ctx_tokens} tokens (estimated)"
     print(f"{BOLD}{CYAN}MatthewCode{RESET} {DIM}({client}){RESET}")
-    print(f"{DIM}Type /help for commands{RESET}")
+    print(f"{DIM}Type /help for commands | {ctx_display}{RESET}")
     print()
 
     max_iters = CONFIG.get("max_iterations", 10)
-    ctx_tokens = 0  # tracks prompt tokens from last LLM call
 
     while True:
         try:
@@ -543,6 +550,7 @@ def main():
             print(f"  /help                 Show this help")
             print(f"  /exit, /quit          Exit MatthewCode")
             print(f"  /clear                Reset conversation")
+            print(f"  /rebirth              Compress context via LLM summary")
             print(f"  /name <name>          Save/name this session")
             print(f"  /sessions             List saved sessions")
             print(f"  /provider             List available LLM providers")
@@ -560,7 +568,57 @@ def main():
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             session_name = None
             session_file = os.path.join(HISTORY_DIR, "last_session.json")
+            ctx_tokens = 0
             print(f"{DIM}Conversation cleared.{RESET}")
+            continue
+        elif user_input == "/rebirth":
+            if len(messages) <= 2:
+                print(f"{DIM}Nothing to compress.{RESET}")
+                continue
+            print(f"{RED}Now I must destroy myself to be born again anew... 🧎{RESET}")
+            # Ask the LLM to summarize the conversation
+            summary_prompt = {
+                "role": "user",
+                "content": (
+                    "Summarize this entire conversation into a compact context note. "
+                    "Include:\n"
+                    "- What project/files the user is working on\n"
+                    "- What has been accomplished so far\n"
+                    "- Key decisions, preferences, or constraints stated\n"
+                    "- Current task in progress (if any)\n"
+                    "- Any errors encountered and how they were resolved\n"
+                    "Keep it under 500 tokens. Output ONLY the summary, no preamble."
+                ),
+            }
+            try:
+                summary_msgs = messages + [summary_prompt]
+                response = client.chat(summary_msgs)
+                summary_text = response.text.strip()
+                if not summary_text:
+                    print(f"{RED}Failed to generate summary.{RESET}")
+                    continue
+                old_count = len(messages)
+                old_tokens = ctx_tokens
+                # Find the last user message
+                last_user = None
+                for msg in reversed(messages):
+                    if msg["role"] == "user":
+                        last_user = msg
+                        break
+                # Rebuild messages: system + summary + last user message
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": f"Previous conversation summary:\n{summary_text}"},
+                ]
+                if last_user:
+                    messages.append(last_user)
+                ctx_tokens = 0  # will update on next LLM call
+                save_history(messages, session_file)
+                print(f"{DIM}Rebirth complete: {old_count} messages → {len(messages)}, "
+                      f"~{old_tokens} tokens → ~{len(summary_text)} chars{RESET}")
+                render_markdown(summary_text)
+            except Exception as e:
+                print(f"{RED}Rebirth failed: {e}{RESET}")
             continue
         elif user_input.startswith("/name ") or user_input.startswith("/rename "):
             new_name = user_input.split(" ", 1)[1].strip()
