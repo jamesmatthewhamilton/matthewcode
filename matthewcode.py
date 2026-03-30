@@ -722,14 +722,18 @@ def main():
                     if fallback:
                         print(f"{DIM}(parsed tool call from text){RESET}")
                         messages.append({"role": "assistant", "content": full_content})
+                        rejected = False
                         for name, tc_args in fallback:
                             print(f"{DIM}[{name}: {_tool_summary(name, tc_args)}]{RESET}")
                             if name not in SAFE_TOOLS and not args.yes:
                                 if not confirm_tool(name, tc_args):
-                                    messages.append({"role": "tool", "content": "User rejected this action. Do NOT retry the same action. Ask the user what they want or try a different approach."})
-                                    continue
+                                    messages.append({"role": "assistant", "content": "The user rejected this action. Do not call any more tools. Instead, ask the user what they would like you to do differently. You may suggest an alternative approach."})
+                                    rejected = True
+                                    break
                             result = TOOL_DISPATCH[name](tc_args)
                             messages.append({"role": "tool", "content": result})
+                        if rejected:
+                            break
                         continue
 
                 # No tool calls at all — done
@@ -769,8 +773,8 @@ def main():
 
                     if name not in SAFE_TOOLS and not args.yes:
                         if not confirm_tool(name, tc_args):
-                            messages.append({"role": "tool", "tool_call_id": call_id, "content": "User rejected this action. Do NOT retry the same action. Ask the user what they want or try a different approach."})
-                            continue
+                            messages.append({"role": "tool", "tool_call_id": call_id, "content": "The user rejected this action. Do not call any more tools. Instead, ask the user what they would like you to do differently. You may suggest an alternative approach."})
+                            break
 
                     if name in TOOL_DISPATCH:
                         result = TOOL_DISPATCH[name](tc_args)
