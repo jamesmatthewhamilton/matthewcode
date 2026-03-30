@@ -14,8 +14,19 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "common", "python"))
 
 from llm_connections import LLMConnection
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.theme import Theme
 
-# ANSI colors
+console = Console(theme=Theme({
+    "info": "dim",
+    "warning": "yellow",
+    "error": "bold red",
+    "success": "green",
+    "prompt": "green",
+}))
+
+# ANSI colors (kept for simple inline use)
 CYAN = "\033[36m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
@@ -23,6 +34,17 @@ RED = "\033[31m"
 DIM = "\033[2m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
+
+
+def render_markdown(text: str):
+    """Render markdown text (tables, code blocks, bold, etc.) to terminal."""
+    if not text.strip():
+        return
+    try:
+        console.print(Markdown(text))
+    except Exception:
+        # Fallback to plain text if rich fails
+        print(text)
 
 HISTORY_DIR = os.path.expanduser("~/.matthewcode")
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config", "config.yaml")
@@ -538,7 +560,9 @@ def main():
                 for chunk in response:
                     if chunk.text:
                         full_content += chunk.text
-                        print(chunk.text, end="", flush=True)
+                        # Show a spinner/dot for responsiveness
+                        sys.stdout.write(".")
+                        sys.stdout.flush()
                     if chunk.tool_calls:
                         tool_calls.extend(chunk.tool_calls)
 
@@ -548,8 +572,10 @@ def main():
                 if not tool_calls:
                     tool_calls = response.tool_calls
 
+                # Clear the dots and render the response
                 if full_content:
-                    print()
+                    sys.stdout.write("\r\033[K")  # clear the dots line
+                    render_markdown(full_content)
 
                 # No native tool calls — try fallback text parsing
                 if not tool_calls and full_content:
