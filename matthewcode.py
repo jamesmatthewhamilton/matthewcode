@@ -472,6 +472,8 @@ def main():
                         default=CONFIG.get("auto_approve", False), help="Auto-approve all tool calls")
     parser.add_argument("--continue", "-c", dest="resume", action="store_true",
                         help="Resume last conversation")
+    parser.add_argument("--resume", dest="resume_name", default=None,
+                        help="Resume a named session (e.g. --resume myproject)")
     parser.add_argument("--verbose", "-v", action="store_true",
                         default=CONFIG.get("verbose", False), help="Show tool call details")
     args = parser.parse_args()
@@ -483,12 +485,26 @@ def main():
         print(f"{RED}{e}{RESET}")
         sys.exit(1)
 
-    session_file = os.path.join(HISTORY_DIR, "last_session.json")
+    session_name = None
+    if args.resume_name:
+        session_name = args.resume_name
+        session_file = os.path.join(HISTORY_DIR, f"{session_name}.json")
+        if not os.path.isfile(session_file):
+            print(f"{RED}Session '{session_name}' not found.{RESET}")
+            # List available sessions
+            sessions = [f[:-5] for f in os.listdir(HISTORY_DIR) if f.endswith(".json")]
+            if sessions:
+                print(f"{DIM}Available sessions: {', '.join(sessions)}{RESET}")
+            sys.exit(1)
+    else:
+        session_file = os.path.join(HISTORY_DIR, "last_session.json")
+
     messages = []
-    if args.resume:
+    if args.resume or args.resume_name:
         messages = load_history(session_file)
         if messages:
-            print(f"{DIM}Resumed conversation ({len(messages)} messages){RESET}")
+            label = session_name or "last session"
+            print(f"{DIM}Resumed '{label}' ({len(messages)} messages){RESET}")
 
     if not messages:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -515,6 +531,8 @@ def main():
             print(f"  /help                 Show this help")
             print(f"  /exit, /quit          Exit MatthewCode")
             print(f"  /clear                Reset conversation")
+            print(f"  /name <name>          Save/name this session")
+            print(f"  /sessions             List saved sessions")
             print(f"  /provider             List available LLM providers")
             print(f"  /provider <name>      Switch to a different provider")
             print(f"  /verbose              Toggle verbose mode")
@@ -528,7 +546,48 @@ def main():
             break
         elif user_input == "/clear":
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            session_name = None
+            session_file = os.path.join(HISTORY_DIR, "last_session.json")
             print(f"{DIM}Conversation cleared.{RESET}")
+            continue
+        elif user_input.startswith("/name ") or user_input.startswith("/rename "):
+            new_name = user_input.split(" ", 1)[1].strip()
+            if not new_name:
+                print(f"{RED}Usage: /name <session_name>{RESET}")
+                continue
+            new_file = os.path.join(HISTORY_DIR, f"{new_name}.json")
+            if os.path.isfile(new_file) and new_name != session_name:
+                try:
+                    answer = input(f"{YELLOW}Session '{new_name}' exists. Overwrite? [y/N] {RESET}").strip().lower()
+                    if answer not in ("y", "yes"):
+                        print(f"{DIM}Cancelled.{RESET}")
+                        continue
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    continue
+            session_name = new_name
+            session_file = new_file
+            save_history(messages, session_file)
+            print(f"{DIM}Session saved as '{session_name}'{RESET}")
+            continue
+        elif user_input in ("/name", "/rename"):
+            if session_name:
+                print(f"{DIM}Current session: '{session_name}'{RESET}")
+            else:
+                print(f"{DIM}Session unnamed. Usage: /name <session_name>{RESET}")
+            continue
+        elif user_input == "/sessions":
+            os.makedirs(HISTORY_DIR, exist_ok=True)
+            sessions = sorted(f[:-5] for f in os.listdir(HISTORY_DIR) if f.endswith(".json"))
+            if sessions:
+                print(f"{DIM}Saved sessions:{RESET}")
+                for s in sessions:
+                    marker = f" {CYAN}<- active{RESET}" if s == session_name else ""
+                    fpath = os.path.join(HISTORY_DIR, f"{s}.json")
+                    msgs = load_history(fpath)
+                    print(f"  {s} ({len(msgs)} messages){marker}")
+            else:
+                print(f"{DIM}No saved sessions.{RESET}")
             continue
         elif user_input == "/provider":
             print(f"{DIM}Available providers:{RESET}")
