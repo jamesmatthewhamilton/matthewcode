@@ -505,6 +505,14 @@ def main():
         if messages:
             label = session_name or "last session"
             print(f"{DIM}Resumed '{label}' ({len(messages)} messages){RESET}")
+            # Add a separator so the model treats the next input as a fresh request
+            if messages[-1]["role"] != "user":
+                messages.append({
+                    "role": "system",
+                    "content": "The user has returned to this session. "
+                    "Wait for their next message. Do not continue any previous task "
+                    "unless they explicitly ask you to."
+                })
 
     if not messages:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
