@@ -9,3 +9,4 @@ dependencies:
   - pip:
     - ollama
     - rich
+    - prompt_toolkit

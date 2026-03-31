@@ -17,6 +17,9 @@ from llm_connections import LLMConnection
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.theme import Theme
+from prompt_toolkit import prompt as pt_prompt
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.formatted_text import ANSI
 
 console = Console(theme=Theme({
     "info": "dim",
@@ -530,6 +533,8 @@ def main():
     print()
 
     max_iters = CONFIG.get("max_iterations", 10)
+    os.makedirs(HISTORY_DIR, exist_ok=True)
+    pt_history = FileHistory(os.path.join(HISTORY_DIR, "prompt_history"))
 
     while True:
         try:
@@ -572,7 +577,10 @@ def main():
                 bar += sep + part
             bar += TEAL + "—" * right_pad + RESET
             print(bar)
-            user_input = input("◗ ").strip()
+            user_input = pt_prompt(
+                ANSI("◗ "),
+                history=pt_history,
+            ).strip()
         except (EOFError, KeyboardInterrupt):
             print(f"\n{DIM}Bye!{RESET}")
             break
