@@ -526,17 +526,45 @@ def main():
     while True:
         try:
             if ctx_tokens > 0:
-                # Show token count in prompt
                 num_ctx = getattr(client, '_provider', None) and client._provider.config.get("num_ctx", 0) or 0
                 if num_ctx:
-                    pct = int(ctx_tokens / num_ctx * 100)
-                    ctx_color = RED if pct >= 90 else YELLOW if pct >= 70 else DIM
-                    ctx_info = f"{ctx_color}[{ctx_tokens}/{num_ctx} tokens]{RESET} "
+                    ctx_info = f"[{ctx_tokens}/{num_ctx} tokens]"
                 else:
-                    ctx_info = f"{DIM}[{ctx_tokens} tokens]{RESET} "
+                    ctx_info = f"[{ctx_tokens} tokens]"
             else:
                 ctx_info = ""
-            user_input = input(f"{ctx_info}◗ ").strip()
+            TEAL = "\033[36m"
+            TEAL_BG = "\033[46;30m"  # teal background, black text
+            try:
+                tw = os.get_terminal_size().columns
+            except OSError:
+                tw = 80
+            # Build bar: ———— [tokens] ———— [session] ——
+            right_pad = 2
+            sep = TEAL + "——" + RESET
+            parts = []
+            tokens_part = ctx_info.strip() if ctx_info.strip() else ""
+            session_part = session_name if session_name else ""
+            visible_len = right_pad
+            if tokens_part:
+                if ctx_tokens >= 20000:
+                    token_bg = "\033[5;41;30m"   # blinking red background, black text
+                elif ctx_tokens >= 10000:
+                    token_bg = "\033[5;43;30m"   # blinking yellow background, black text
+                else:
+                    token_bg = TEAL_BG
+                parts.append(token_bg + f" {tokens_part} " + RESET)
+                visible_len += len(f" {tokens_part} ") + 2  # +2 for —— separator
+            if session_part:
+                parts.append(TEAL_BG + f" {session_part} " + RESET)
+                visible_len += len(f" {session_part} ") + 2
+            dash_len = tw - visible_len
+            bar = TEAL + "—" * max(dash_len, 1) + RESET
+            for part in parts:
+                bar += sep + part
+            bar += TEAL + "—" * right_pad + RESET
+            print(bar)
+            user_input = input("◗ ").strip()
         except (EOFError, KeyboardInterrupt):
             print(f"\n{DIM}Bye!{RESET}")
             break
@@ -575,7 +603,17 @@ def main():
             if len(messages) <= 2:
                 print(f"{DIM}Nothing to compress.{RESET}")
                 continue
-            print(f"{RED}Now I must destroy myself to be born again anew... 🧎{RESET}")
+            RED_LINE = "\033[31m"
+            RED_BG = "\033[41;30m"
+            try:
+                tw_r = os.get_terminal_size().columns
+            except OSError:
+                tw_r = 80
+            rebirth_text = " Now I must destroy myself to be born again anew... 🧎 "
+            # Emoji takes 2 columns
+            visible_len = len(rebirth_text) + 1
+            dash_len = tw_r - visible_len
+            print(RED_BG + rebirth_text + RESET + RED_LINE + "—" * max(dash_len, 0) + RESET)
             # Ask the LLM to summarize the conversation
             summary_prompt = {
                 "role": "user",
@@ -591,7 +629,15 @@ def main():
                 ),
             }
             try:
-                summary_msgs = messages + [summary_prompt]
+                # Sanitize messages: fix string arguments, strip tool_calls
+                clean_msgs = []
+                for msg in messages:
+                    m = dict(msg)
+                    if "tool_calls" in m:
+                        # Strip tool_calls to avoid serialization issues
+                        del m["tool_calls"]
+                    clean_msgs.append(m)
+                summary_msgs = clean_msgs + [summary_prompt]
                 response = client.chat(summary_msgs)
                 summary_text = response.text.strip()
                 if not summary_text:
@@ -751,7 +797,7 @@ def main():
                         "type": "function",
                         "function": {
                             "name": tc["name"],
-                            "arguments": json.dumps(tc["arguments"]) if isinstance(tc["arguments"], dict) else tc["arguments"],
+                            "arguments": tc["arguments"] if isinstance(tc["arguments"], dict) else json.loads(tc["arguments"]),
                         },
                     }
                     for i, tc in enumerate(tool_calls)
