@@ -72,31 +72,22 @@ def load_config() -> dict:
 CONFIG = load_config()
 MAX_BASH_OUTPUT = CONFIG.get("max_bash_output", 30_000)
 
-SYSTEM_PROMPT = f"""You are MatthewCode, a coding assistant with access to tools. \
-You MUST use your tools to accomplish tasks. NEVER describe what you would do — DO IT.
+PROMPT_VARS = {
+    "home_dir": os.path.expanduser("~"),
+    "working_dir": os.getcwd(),
+}
 
-Environment:
-- Home directory: {os.path.expanduser("~")}
-- Working directory: {os.getcwd()}
 
-You have these tools: file_read, file_write, file_edit, bash_run, dir_list, file_find, file_grep.
-When the user asks you to create, read, edit, or run something, CALL THE TOOL IMMEDIATELY. \
-Do not print the tool call as text. Do not ask the user to run commands. Execute them yourself.
+def get_prompt(pipeline: str, prompt_type: str, **extra_vars) -> str:
+    """Get a prompt from config. pipeline='pipeline_main', prompt_type='system_prompt'."""
+    template = CONFIG.get(pipeline, {}).get(prompt_type, "")
+    if not template:
+        return ""
+    all_vars = {**PROMPT_VARS, **extra_vars}
+    return template.format(**all_vars)
 
-Workflow:
-1. Think briefly about what to do (1-2 sentences max)
-2. Call the appropriate tool(s)
-3. If a tool returns an error, try to fix it (max 3 attempts, then explain the issue)
-4. Report the result concisely
 
-Rules:
-- ALWAYS read a file before editing it
-- Use file_edit for small changes, file_write for new files or full rewrites
-- For file_edit: old_text must match EXACTLY what is in the file
-- If bash_run fails, read the error, fix the issue, and retry
-- Never delete files unless explicitly asked
-- Do not repeat yourself. If you already tried something and it failed, try a DIFFERENT approach
-- Be concise. No unnecessary explanations."""
+SYSTEM_PROMPT = get_prompt("pipeline_main", "system_prompt")
 
 # --- Tool definitions ---
 
@@ -523,9 +514,7 @@ def main():
             if messages[-1]["role"] != "user":
                 messages.append({
                     "role": "system",
-                    "content": "The user has returned to this session. "
-                    "Wait for their next message. Do not continue any previous task "
-                    "unless they explicitly ask you to."
+                    "content": get_prompt("pipeline_session_resume", "system_prompt"),
                 })
 
     if not messages:
@@ -644,16 +633,7 @@ def main():
             # Ask the LLM to summarize the conversation
             summary_prompt = {
                 "role": "user",
-                "content": (
-                    "Summarize this entire conversation into a compact context note. "
-                    "Include:\n"
-                    "- What project/files the user is working on\n"
-                    "- What has been accomplished so far\n"
-                    "- Key decisions, preferences, or constraints stated\n"
-                    "- Current task in progress (if any)\n"
-                    "- Any errors encountered and how they were resolved\n"
-                    "Keep it under 500 tokens. Output ONLY the summary, no preamble."
-                ),
+                "content": get_prompt("pipeline_rebirth", "user_prompt"),
             }
             try:
                 # Sanitize messages: fix string arguments, strip tool_calls
@@ -749,7 +729,8 @@ def main():
                 print(f"{RED}{e}{RESET}")
             continue
 
-        messages.append({"role": "user", "content": user_input})
+        formatted_input = get_prompt("pipeline_main", "user_prompt", user_input=user_input)
+        messages.append({"role": "user", "content": formatted_input})
 
         # Agent loop
         for _iter in range(max_iters):
@@ -803,7 +784,7 @@ def main():
                             is_safe = name in SAFE_TOOLS and not is_protected_path(tool_path, protected)
                             if not is_safe and not args.yes:
                                 if not confirm_tool(name, tc_args):
-                                    messages.append({"role": "assistant", "content": "The user rejected this action. Do not call any more tools. Instead, ask the user what they would like you to do differently. You may suggest an alternative approach."})
+                                    messages.append({"role": "assistant", "content": get_prompt("pipeline_tool_rejected", "system_prompt")})
                                     rejected = True
                                     break
                             result = TOOL_DISPATCH[name](tc_args)
@@ -852,7 +833,7 @@ def main():
                     is_safe = name in SAFE_TOOLS and not is_protected_path(tool_path, protected)
                     if not is_safe and not args.yes:
                         if not confirm_tool(name, tc_args):
-                            messages.append({"role": "tool", "tool_call_id": call_id, "content": "The user rejected this action. Do not call any more tools. Instead, ask the user what they would like you to do differently. You may suggest an alternative approach."})
+                            messages.append({"role": "tool", "tool_call_id": call_id, "content": get_prompt("pipeline_tool_rejected", "system_prompt")})
                             break
 
                     if name in TOOL_DISPATCH:
