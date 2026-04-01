@@ -560,9 +560,9 @@ def main():
             session_part = session_name if session_name else ""
             visible_len = right_pad
             if tokens_part:
-                if ctx_tokens >= 20000:
+                if ctx_tokens >= 100000:
                     token_bg = "\033[5;41;30m"   # blinking red background, black text
-                elif ctx_tokens >= 10000:
+                elif ctx_tokens >= 60000:
                     token_bg = "\033[5;43;30m"   # blinking yellow background, black text
                 else:
                     token_bg = TEAL_BG
@@ -645,7 +645,20 @@ def main():
                         del m["tool_calls"]
                     clean_msgs.append(m)
                 summary_msgs = clean_msgs + [summary_prompt]
-                response = client.chat(summary_msgs)
+                # Use streaming (same as normal prompts) for compatibility
+                for attempt in range(3):
+                    try:
+                        response = client.chat(summary_msgs, stream=True)
+                        # Consume the stream to get full text
+                        for chunk in response:
+                            pass
+                        break
+                    except Exception as e:
+                        if ("429" in str(e) or "401" in str(e)) and attempt < 2:
+                            print(f"{DIM}Retrying in 5s... ({e}){RESET}")
+                            time.sleep(5)
+                        else:
+                            raise
                 summary_text = response.text.strip()
                 if not summary_text:
                     print(f"{RED}Failed to generate summary.{RESET}")
