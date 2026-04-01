@@ -636,19 +636,27 @@ def main():
                 "content": get_prompt("pipeline_rebirth", "user_prompt"),
             }
             try:
-                # Sanitize messages: fix string arguments, strip tool_calls
+                # Sanitize and trim messages for summarization
+                # Strip tool_calls, keep only user/assistant text, limit size
                 clean_msgs = []
                 for msg in messages:
                     m = dict(msg)
                     if "tool_calls" in m:
-                        # Strip tool_calls to avoid serialization issues
                         del m["tool_calls"]
+                    # Skip large tool results to save tokens
+                    if m.get("role") == "tool":
+                        content = str(m.get("content", ""))
+                        if len(content) > 500:
+                            m["content"] = content[:500] + "... [truncated]"
                     clean_msgs.append(m)
+                # If still too many messages, keep system + last 30
+                if len(clean_msgs) > 32:
+                    clean_msgs = [clean_msgs[0]] + clean_msgs[-30:]
                 summary_msgs = clean_msgs + [summary_prompt]
                 # Use streaming (same as normal prompts) for compatibility
                 for attempt in range(3):
                     try:
-                        response = client.chat(summary_msgs, stream=True)
+                        response = client.chat(summary_msgs, tools=TOOLS, stream=True)
                         # Consume the stream to get full text
                         for chunk in response:
                             pass
