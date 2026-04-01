@@ -51,13 +51,22 @@ pipeline_session_resume:
 # ── Pipeline: Rebirth (context compression)
 pipeline_rebirth:
   user_prompt: |
-    Summarize this entire conversation into a compact context note. Include:
-    - What project/files the user is working on
-    - What has been accomplished so far
-    - Key decisions, preferences, or constraints stated
-    - Current task in progress (if any)
-    - Any errors encountered and how they were resolved
-    Keep it under 500 tokens. Output ONLY the summary, no preamble.
+    Summarize this conversation organized by project. For each project
+    directory that was worked on, create a section with this format:
+
+    ## ~/Repos/ProjectName/
+    Summary: Brief description of the project and what was accomplished.
+    Decisions: Key decisions, preferences, or constraints the user stated.
+    Errors: Any errors encountered and how they were resolved.
+    In progress: Current task if unfinished.
+    Files written or edited:
+      - hello.cpp — C++ hello world program. Created from scratch.
+      - GNUmakefile — build config. Edited to switch from g++ to clang++.
+
+    Only list files that were written or edited, not every file that was read.
+    Include ALL projects that were worked on, each as its own section.
+
+    Keep it under 5000 tokens. Output ONLY the summary, no preamble.
 
 # ── Pipeline: Tool rejected by user
 pipeline_tool_rejected:
