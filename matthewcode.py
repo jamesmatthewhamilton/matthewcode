@@ -630,63 +630,33 @@ def main():
             visible_len = len(rebirth_text) + 1
             dash_len = tw_r - visible_len
             print(RED_BG + rebirth_text + RESET + RED_LINE + "—" * max(dash_len, 0) + RESET)
-            # Ask the LLM to summarize the conversation
-            summary_prompt = {
-                "role": "user",
-                "content": get_prompt("pipeline_rebirth", "user_prompt"),
-            }
+            # Use the exact same chat path as normal prompts
             try:
-                # Sanitize and trim messages for summarization
-                # Strip tool_calls, keep only user/assistant text, limit size
-                clean_msgs = []
-                for msg in messages:
-                    m = dict(msg)
-                    if "tool_calls" in m:
-                        del m["tool_calls"]
-                    # Skip large tool results to save tokens
-                    if m.get("role") == "tool":
-                        content = str(m.get("content", ""))
-                        if len(content) > 500:
-                            m["content"] = content[:500] + "... [truncated]"
-                    clean_msgs.append(m)
-                # If still too many messages, keep system + last 30
-                if len(clean_msgs) > 32:
-                    clean_msgs = [clean_msgs[0]] + clean_msgs[-30:]
-                summary_msgs = clean_msgs + [summary_prompt]
-                # Use streaming (same as normal prompts) for compatibility
-                for attempt in range(3):
-                    try:
-                        response = client.chat(summary_msgs, tools=TOOLS, stream=True)
-                        # Consume the stream to get full text
-                        for chunk in response:
-                            pass
-                        break
-                    except Exception as e:
-                        if ("429" in str(e) or "401" in str(e)) and attempt < 2:
-                            print(f"{DIM}Retrying in 5s... ({e}){RESET}")
-                            time.sleep(5)
-                        else:
-                            raise
-                summary_text = response.text.strip()
+                rebirth_prompt = get_prompt("pipeline_rebirth", "user_prompt")
+                messages.append({"role": "user", "content": rebirth_prompt})
+                old_count = len(messages) - 1
+                old_tokens = ctx_tokens
+
+                response = client.chat(messages, tools=TOOLS, stream=True)
+                summary_text = ""
+                for chunk in response:
+                    if chunk.text:
+                        summary_text += chunk.text
                 if not summary_text:
+                    summary_text = response.text
+                summary_text = summary_text.strip()
+
+                if not summary_text:
+                    messages.pop()  # remove rebirth prompt
                     print(f"{RED}Failed to generate summary.{RESET}")
                     continue
-                old_count = len(messages)
-                old_tokens = ctx_tokens
-                # Find the last user message
-                last_user = None
-                for msg in reversed(messages):
-                    if msg["role"] == "user":
-                        last_user = msg
-                        break
-                # Rebuild messages: system + summary + last user message
+
+                # Rebuild messages: system + summary
                 messages = [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "system", "content": f"Previous conversation summary:\n{summary_text}"},
                 ]
-                if last_user:
-                    messages.append(last_user)
-                ctx_tokens = 0  # will update on next LLM call
+                ctx_tokens = 0
                 save_history(messages, session_file)
                 print(f"{DIM}Rebirth complete: {old_count} messages → {len(messages)}, "
                       f"~{old_tokens} tokens → ~{len(summary_text)} chars{RESET}")
