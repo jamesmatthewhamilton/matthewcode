@@ -3,3 +3,9 @@ max_iterations: 100
 max_bash_output: 30000
 verbose: false
 default_provider: default
+
+rules:
+  protected_paths:
+    - ~/.*           # all hidden dirs/files (ssh, aws, gnupg, etc.)
+    - /etc/          # system config
+    - /private/      # macOS system files

@@ -218,6 +218,17 @@ TOOLS = [
 SAFE_TOOLS = {"file_read", "dir_list", "file_find", "file_grep"}
 
 
+def is_protected_path(path: str, protected: list) -> bool:
+    """Check if a path matches any protected path pattern."""
+    import fnmatch
+    path = os.path.expanduser(path)
+    for pattern in protected:
+        pattern = os.path.expanduser(pattern)
+        if fnmatch.fnmatch(path, pattern) or path.startswith(pattern.rstrip("*")):
+            return True
+    return False
+
+
 # --- Tool implementations ---
 
 
@@ -787,7 +798,10 @@ def main():
                         rejected = False
                         for name, tc_args in fallback:
                             print(f"{DIM}[{name}: {_tool_summary(name, tc_args)}]{RESET}")
-                            if name not in SAFE_TOOLS and not args.yes:
+                            protected = CONFIG.get("rules", {}).get("protected_paths", [])
+                            tool_path = tc_args.get("path", "")
+                            is_safe = name in SAFE_TOOLS and not is_protected_path(tool_path, protected)
+                            if not is_safe and not args.yes:
                                 if not confirm_tool(name, tc_args):
                                     messages.append({"role": "assistant", "content": "The user rejected this action. Do not call any more tools. Instead, ask the user what they would like you to do differently. You may suggest an alternative approach."})
                                     rejected = True
@@ -833,7 +847,10 @@ def main():
                     else:
                         print(f"{DIM}[{name}: {_tool_summary(name, tc_args)}]{RESET}")
 
-                    if name not in SAFE_TOOLS and not args.yes:
+                    protected = CONFIG.get("rules", {}).get("protected_paths", [])
+                    tool_path = tc_args.get("path", "")
+                    is_safe = name in SAFE_TOOLS and not is_protected_path(tool_path, protected)
+                    if not is_safe and not args.yes:
                         if not confirm_tool(name, tc_args):
                             messages.append({"role": "tool", "tool_call_id": call_id, "content": "The user rejected this action. Do not call any more tools. Instead, ask the user what they would like you to do differently. You may suggest an alternative approach."})
                             break
