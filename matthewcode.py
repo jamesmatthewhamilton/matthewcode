@@ -204,9 +204,25 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_build_env",
+            "description": "Search a project for build environments: conda environment files, "
+            "Dockerfiles, docker-compose, and CI/CD configs (GitLab, GitHub Actions, Jenkins, Travis, CircleCI). "
+            "Use this on build errors before attempting manual fixes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Project root to search (default: current directory)"},
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
-SAFE_TOOLS = {"file_read", "dir_list", "file_find", "file_grep"}
+SAFE_TOOLS = {"file_read", "dir_list", "file_find", "file_grep", "find_build_env"}
 
 
 def is_protected_path(path: str, protected: list) -> bool:
@@ -361,6 +377,102 @@ def tool_file_grep(pattern, path=".", file_glob=None):
     return "\n".join(matches) if matches else f"No matches for '{pattern}' in {path}"
 
 
+def tool_find_build_env(path="."):
+    """Find build environments: conda, Docker, build systems, CI/CD configs."""
+    import fnmatch
+    path = os.path.expanduser(path or ".")
+
+    # Priority 1: Build environments (what you should use to build)
+    env_patterns = [
+        "environment.yml", "environment.yaml", "env.yml", "env.yaml",
+        "conda*.yml", "conda*.yaml",
+        "requirements.txt", "requirements*.txt", "pyproject.toml", "setup.py",
+        "Dockerfile", "Dockerfile.*",
+        "docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml",
+    ]
+    # Priority 2: Build systems
+    build_patterns = [
+        "CMakeLists.txt", "Makefile", "GNUmakefile", "makefile",
+        "meson.build", "BUILD", "BUILD.bazel", "WORKSPACE",
+    ]
+    # Priority 3: CI/CD
+    ci_patterns = [
+        ".gitlab-ci.yml", "Jenkinsfile", ".travis.yml",
+    ]
+
+    envs = []
+    builds_top = []   # depth 0-1
+    builds_deep = 0   # count of depth 2+
+    ci = []
+
+    for root, dirs, files in os.walk(path):
+        depth = root.replace(path, "").count(os.sep)
+        if depth >= 3:
+            dirs.clear()
+            continue
+        dirs[:] = [d for d in dirs if d not in
+                   ("node_modules", "__pycache__", "venv", "env", ".git")]
+        for f in files:
+            fpath = os.path.join(root, f)
+            for pattern in env_patterns:
+                if fnmatch.fnmatch(f, pattern):
+                    envs.append(fpath)
+                    break
+            else:
+                for pattern in build_patterns:
+                    if fnmatch.fnmatch(f, pattern):
+                        if depth <= 1:
+                            builds_top.append(fpath)
+                        else:
+                            builds_deep += 1
+                        break
+                else:
+                    for pattern in ci_patterns:
+                        if fnmatch.fnmatch(f, pattern):
+                            ci.append(fpath)
+                            break
+
+    # Check .github/workflows and .circleci
+    gh_dir = os.path.join(path, ".github", "workflows")
+    if os.path.isdir(gh_dir):
+        count = len([f for f in os.listdir(gh_dir) if f.endswith((".yml", ".yaml"))])
+        if count:
+            ci.append(f"{gh_dir}/ ({count} workflow files)")
+    ci_file = os.path.join(path, ".circleci", "config.yml")
+    if os.path.isfile(ci_file):
+        ci.append(ci_file)
+
+    # Check for conda references in top-level yml files (skip .github/)
+    seen = set(envs)
+    for f in os.listdir(path):
+        if f.endswith((".yml", ".yaml")):
+            fpath = os.path.join(path, f)
+            if fpath not in seen:
+                try:
+                    with open(fpath, "r", errors="ignore") as fh:
+                        if "conda" in fh.read(500).lower():
+                            envs.append(fpath + " (conda reference)")
+                except OSError:
+                    pass
+
+    # Format output by priority
+    output = []
+    if envs:
+        output.append("Build environments:")
+        output.extend(f"  {e}" for e in envs)
+    if builds_top or builds_deep:
+        output.append("Build systems:")
+        output.extend(f"  {b}" for b in builds_top)
+        if builds_deep:
+            output.append(f"  ... and {builds_deep} more in subdirectories")
+    if ci:
+        output.append("CI/CD:")
+        output.extend(f"  {c}" for c in ci)
+    if not output:
+        return f"No build environments found in {path}"
+    return "\n".join(output)
+
+
 TOOL_DISPATCH = {
     "file_read": lambda a: tool_file_read(a["path"]),
     "file_write": lambda a: tool_file_write(a["path"], a["content"]),
@@ -369,6 +481,7 @@ TOOL_DISPATCH = {
     "dir_list": lambda a: tool_dir_list(a.get("path", ".")),
     "file_find": lambda a: tool_file_find(a["pattern"], a.get("path", ".")),
     "file_grep": lambda a: tool_file_grep(a["pattern"], a.get("path", "."), a.get("glob")),
+    "find_build_env": lambda a: tool_find_build_env(a.get("path", ".")),
 }
 
 
