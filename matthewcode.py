@@ -661,8 +661,8 @@ def main():
                         default=CONFIG.get("auto_approve", False), help="Auto-approve all tool calls")
     parser.add_argument("--continue", "-c", dest="resume", action="store_true",
                         help="Resume last conversation")
-    parser.add_argument("--resume", dest="resume_name", default=None,
-                        help="Resume a named session (e.g. --resume myproject)")
+    parser.add_argument("--session", "-s", dest="resume_name", default=None,
+                        help="Open or create a named session (e.g. --session myproject)")
     parser.add_argument("--verbose", "-v", action="store_true",
                         default=CONFIG.get("verbose", False), help="Show tool call details")
     args = parser.parse_args()
@@ -679,12 +679,7 @@ def main():
         session_name = args.resume_name
         session_file = os.path.join(HISTORY_DIR, f"{session_name}.json")
         if not os.path.isfile(session_file):
-            print(f"{RED}Session '{session_name}' not found.{RESET}")
-            # List available sessions
-            sessions = [f[:-5] for f in os.listdir(HISTORY_DIR) if f.endswith(".json")]
-            if sessions:
-                print(f"{DIM}Available sessions: {', '.join(sessions)}{RESET}")
-            sys.exit(1)
+            print(f"{DIM}Created new session '{session_name}'{RESET}")
     else:
         session_file = os.path.join(HISTORY_DIR, "last_session.json")
 
@@ -693,8 +688,10 @@ def main():
         messages = load_history(session_file)
         if messages:
             messages = sanitize_messages(messages)
-            label = session_name or "last session"
-            print(f"{DIM}Resumed '{label}' ({len(messages)} messages){RESET}")
+            if session_name:
+                print(f"{DIM}Resumed session '{session_name}' ({len(messages)} messages){RESET}")
+            else:
+                print(f"{DIM}Resumed last unnamed session ({len(messages)} messages){RESET}")
             # Add a separator so the model treats the next input as a fresh request
             if messages[-1]["role"] != "user":
                 messages.append({
@@ -745,9 +742,9 @@ def main():
             session_part = session_name if session_name else ""
             visible_len = right_pad
             if tokens_part:
-                if ctx_tokens >= 100000:
+                if ctx_tokens >= 200000:
                     token_bg = "\033[5;41;30m"   # blinking red background, black text
-                elif ctx_tokens >= 60000:
+                elif ctx_tokens >= 120000:
                     token_bg = "\033[5;43;30m"   # blinking yellow background, black text
                 else:
                     token_bg = TEAL_BG
@@ -781,7 +778,8 @@ def main():
             print(f"  /clear                Reset conversation")
             print(f"  /rebirth              Compress context via LLM summary")
             print(f"  /name <name>          Save/name this session")
-            print(f"  /sessions             List saved sessions")
+            print(f"  /session              List saved sessions")
+            print(f"  /session <name>       Switch to a session (creates if new)")
             print(f"  /provider             List available LLM providers")
             print(f"  /provider <name>      Switch to a different provider")
             print(f"  /verbose              Toggle verbose mode")
@@ -875,7 +873,7 @@ def main():
             else:
                 print(f"{DIM}Session unnamed. Usage: /name <session_name>{RESET}")
             continue
-        elif user_input == "/sessions":
+        elif user_input == "/sessions" or user_input == "/session":
             os.makedirs(HISTORY_DIR, exist_ok=True)
             sessions = sorted(f[:-5] for f in os.listdir(HISTORY_DIR) if f.endswith(".json"))
             if sessions:
@@ -887,6 +885,25 @@ def main():
                     print(f"  {s} ({len(msgs)} messages){marker}")
             else:
                 print(f"{DIM}No saved sessions.{RESET}")
+            continue
+        elif user_input.startswith("/session "):
+            new_session = user_input.split(" ", 1)[1].strip()
+            if not new_session:
+                print(f"{RED}Usage: /session <name>{RESET}")
+                continue
+            # Save current session before switching
+            save_history(messages, session_file)
+            # Switch to new session
+            session_name = new_session
+            session_file = os.path.join(HISTORY_DIR, f"{session_name}.json")
+            if os.path.isfile(session_file):
+                messages = load_history(session_file)
+                messages = sanitize_messages(messages)
+                print(f"{DIM}Switched to '{session_name}' ({len(messages)} messages){RESET}")
+            else:
+                messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                print(f"{DIM}Created new session '{session_name}'{RESET}")
+            ctx_tokens = 0
             continue
         elif user_input == "/provider":
             print(f"{DIM}Available providers:{RESET}")
