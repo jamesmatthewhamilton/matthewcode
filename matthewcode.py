@@ -454,6 +454,77 @@ def load_history(session_file):
     return []
 
 
+def sanitize_messages(messages: list) -> list:
+    """Fix corrupted message history from interrupted sessions.
+
+    Rules:
+    - Every tool_calls in assistant must have matching tool results after it
+    - Arguments in tool_calls must be dicts, not strings
+    - No trailing assistant messages with empty content and no tool_calls
+    - Messages must have 'role' and 'content'
+    """
+    if not messages:
+        return messages
+
+    cleaned = []
+    removed = 0
+    for msg in messages:
+        # Skip messages missing required fields
+        if "role" not in msg:
+            removed += 1
+            continue
+
+        m = dict(msg)
+
+        # Fix string arguments in tool_calls
+        if "tool_calls" in m:
+            fixed_calls = []
+            for tc in m["tool_calls"]:
+                func = tc.get("function", {})
+                args = func.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        func["arguments"] = json.loads(args)
+                    except json.JSONDecodeError:
+                        func["arguments"] = {}
+                fixed_calls.append(tc)
+            m["tool_calls"] = fixed_calls
+
+        cleaned.append(m)
+
+    # Remove trailing incomplete messages (assistant/tool without a following user)
+    while len(cleaned) > 1 and cleaned[-1]["role"] in ("assistant", "tool"):
+        # Check if assistant has empty content and no tool_calls
+        last = cleaned[-1]
+        if last["role"] == "assistant" and not last.get("content") and not last.get("tool_calls"):
+            cleaned.pop()
+            removed += 1
+        # Check for orphaned tool results (tool without preceding assistant tool_calls)
+        elif last["role"] == "tool":
+            # Look back for matching assistant with tool_calls
+            has_match = False
+            for prev in reversed(cleaned[:-1]):
+                if prev["role"] == "assistant" and prev.get("tool_calls"):
+                    has_match = True
+                    break
+                if prev["role"] == "user":
+                    break
+            if not has_match:
+                cleaned.pop()
+                removed += 1
+            else:
+                break
+        else:
+            break
+
+    if removed:
+        print(f"{DIM}(cleaned {removed} corrupted messages from history){RESET}")
+    else:
+        print(f"{DIM}(history inspected — no corruption found){RESET}")
+
+    return cleaned
+
+
 def _tool_summary(name, args):
     if name == "file_read": return args.get("path", "?")
     if name == "file_write": return f"{args.get('path', '?')} ({len(args.get('content', ''))} chars)"
@@ -508,6 +579,7 @@ def main():
     if args.resume or args.resume_name:
         messages = load_history(session_file)
         if messages:
+            messages = sanitize_messages(messages)
             label = session_name or "last session"
             print(f"{DIM}Resumed '{label}' ({len(messages)} messages){RESET}")
             # Add a separator so the model treats the next input as a fresh request
@@ -843,12 +915,9 @@ def main():
             except Exception as e:
                 err_str = str(e)
                 print(f"\n{RED}Error: {err_str}{RESET}")
-                # If it's a 400 bad request, the messages are malformed
-                # Remove messages back to the last user message to recover
-                if "400" in err_str or "bad request" in err_str.lower():
-                    while messages and messages[-1]["role"] != "user":
-                        messages.pop()
-                    print(f"{DIM}(removed bad messages from history to recover){RESET}")
+                if any(code in err_str for code in ("400", "401", "422")):
+                    messages = sanitize_messages(messages)
+                    save_history(messages, session_file)
                 break
         else:
             print(f"\n{YELLOW}(stopped after {max_iters} iterations){RESET}")
