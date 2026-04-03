@@ -53,23 +53,23 @@ HISTORY_DIR = os.path.expanduser("~/.matthewcode")
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config", "config.yaml")
 
 def load_config() -> dict:
-    """Load app config from config/config.yaml and LLM providers from global config."""
+    """Load app config from config.yaml and LLM providers from global config."""
     import yaml
 
     with open(CONFIG_FILE, "r") as f:
         config = yaml.safe_load(f) or {}
 
-    # Load global LLM providers (~/.llm-connections/config.yaml)
-    LLMConnection.load()
-
-    # Also load from app config if it has llm-providers (overrides/extends)
-    if "llm-providers" in config:
-        LLMConnection.load(CONFIG_FILE)
-
     return config
 
 
 CONFIG = load_config()
+
+
+def load_providers():
+    """Load LLM providers. Called after argparse so --help doesn't wait."""
+    LLMConnection.load()
+    if "llm-providers" in CONFIG:
+        LLMConnection.load(CONFIG_FILE)
 MAX_BASH_OUTPUT = CONFIG.get("max_bash_output", 30_000)
 
 PROMPT_VARS = {
@@ -665,7 +665,12 @@ def main():
                         help="Open or create a named session (e.g. --session myproject)")
     parser.add_argument("--verbose", "-v", action="store_true",
                         default=CONFIG.get("verbose", False), help="Show tool call details")
+    parser.add_argument("--pipe", action="store_true",
+                        help="Pipe mode: read one prompt from stdin, run, print output, exit")
     args = parser.parse_args()
+
+    # Load providers after argparse so --help is instant
+    load_providers()
 
     # Get LLM connection from registry
     try:
@@ -786,6 +791,80 @@ def main():
 
     max_iters = CONFIG.get("max_iterations", 10)
     os.makedirs(HISTORY_DIR, exist_ok=True)
+
+    # Pipe mode: read one prompt from stdin, run, output, exit
+    if args.pipe:
+        user_input = sys.stdin.read().strip()
+        if not user_input:
+            print("No input received.", file=sys.stderr)
+            sys.exit(1)
+        args.yes = True  # auto-approve in pipe mode
+        formatted_input = get_prompt("pipeline_main", "user_prompt", user_input=user_input)
+        messages.append({"role": "user", "content": formatted_input})
+
+        for _iter in range(max_iters):
+            try:
+                response = client.chat(messages, tools=TOOLS, stream=True)
+                full_content = ""
+                tool_calls = []
+                for chunk in response:
+                    if chunk.text:
+                        full_content += chunk.text
+                    if chunk.tool_calls:
+                        tool_calls.extend(chunk.tool_calls)
+                if not full_content:
+                    full_content = response.text
+                if not tool_calls:
+                    tool_calls = response.tool_calls
+
+                # Fallback text parsing
+                if not tool_calls and full_content:
+                    fallback = parse_tool_calls_from_text(full_content)
+                    if fallback:
+                        messages.append({"role": "assistant", "content": full_content})
+                        for name, tc_args in fallback:
+                            print(f"[{name}: {_tool_summary(name, tc_args)}]", file=sys.stderr)
+                            result = TOOL_DISPATCH[name](tc_args)
+                            messages.append({"role": "tool", "content": result})
+                        continue
+
+                if not tool_calls:
+                    if full_content:
+                        messages.append({"role": "assistant", "content": full_content})
+                    break
+
+                # Execute native tool calls
+                assistant_msg = {"role": "assistant", "content": full_content or ""}
+                assistant_msg["tool_calls"] = [
+                    {"id": f"call_{i}", "type": "function",
+                     "function": {"name": tc["name"],
+                                  "arguments": tc["arguments"] if isinstance(tc["arguments"], dict) else json.loads(tc["arguments"])}}
+                    for i, tc in enumerate(tool_calls)
+                ]
+                messages.append(assistant_msg)
+
+                for i, tc in enumerate(tool_calls):
+                    call_id = f"call_{i}"
+                    name = tc["name"]
+                    tc_args = tc["arguments"]
+                    if isinstance(tc_args, str):
+                        tc_args = json.loads(tc_args)
+                    print(f"[{name}: {_tool_summary(name, tc_args)}]", file=sys.stderr)
+                    if name in TOOL_DISPATCH:
+                        result = TOOL_DISPATCH[name](tc_args)
+                    else:
+                        result = f"Error: Unknown tool '{name}'"
+                    messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
+
+            except Exception as e:
+                print(f"Error: {e}", file=sys.stderr)
+                break
+
+        # Output the final response and save
+        print(full_content)
+        save_history(messages, session_file)
+        sys.exit(0)
+
     pt_history = FileHistory(os.path.join(HISTORY_DIR, "prompt_history"))
 
     while True:
