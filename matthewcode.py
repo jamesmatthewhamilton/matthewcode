@@ -293,21 +293,36 @@ def tool_file_edit(path, old_text, new_text):
 
 def tool_bash_run(command, timeout=120):
     try:
-        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.Popen(
+            command, shell=True,
+            stdin=subprocess.DEVNULL,  # no interactive input — EOF immediately
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            return (
+                "Error: Command timed out. This may be because it opened an "
+                "interactive session (e.g., python, node, gdb, ssh). "
+                "All commands must run non-interactively and exit on their own. "
+                "Use flags like -c, --batch, or -e to run commands inline."
+            )
         output = ""
-        if result.stdout:
-            output += result.stdout
-        if result.stderr:
-            output += ("\n" if output else "") + result.stderr
+        if stdout:
+            output += stdout
+        if stderr:
+            output += ("\n" if output else "") + stderr
         if not output:
             output = "(no output)"
-        if result.returncode != 0:
-            output += f"\n[exit code: {result.returncode}]"
+        if proc.returncode != 0:
+            output += f"\n[exit code: {proc.returncode}]"
         if len(output) > MAX_BASH_OUTPUT:
             output = output[:MAX_BASH_OUTPUT] + f"\n[truncated at {MAX_BASH_OUTPUT} chars]"
         return output
-    except subprocess.TimeoutExpired:
-        return f"Error: Command timed out after {timeout} seconds"
     except Exception as e:
         return f"Error running command: {e}"
 
@@ -470,6 +485,11 @@ def tool_find_build_env(path="."):
         output.extend(f"  {c}" for c in ci)
     if not output:
         return f"No build environments found in {path}"
+    # Add conda hint if any conda env files were found
+    has_conda = any("environment" in e.lower() or "conda" in e.lower() for e in envs)
+    if has_conda:
+        output.append("")
+        output.append("Hint: Use 'conda run -n envname <command>' to run commands in a conda env.")
     return "\n".join(output)
 
 
@@ -1105,7 +1125,7 @@ def main():
 
                 # Track context window usage (prompt_tokens = full input context)
                 if response.prompt_tokens:
-                    ctx_tokens = response.prompt_tokens
+                    ctx_tokens = max(ctx_tokens, response.prompt_tokens)
 
                 # Clear the llama animation and render the response
                 if full_content:
@@ -1195,8 +1215,14 @@ def main():
                 err_str = str(e)
                 print(f"\n{RED}Error: {err_str}{RESET}")
                 if any(code in err_str for code in ("400", "401", "422")):
+                    # First try gentle sanitize
                     messages = sanitize_messages(messages)
+                    # If that doesn't help, nuclear option: roll back to last user message
+                    # This removes any mid-conversation corruption
+                    while len(messages) > 1 and messages[-1]["role"] != "user":
+                        messages.pop()
                     save_history(messages, session_file)
+                    print(f"{DIM}(rolled back to last clean state — try again){RESET}")
                 break
         else:
             print(f"\n{YELLOW}(stopped after {max_iters} iterations){RESET}")
