@@ -44,7 +44,9 @@ pipeline_main:
 
     DevOps Rules:
     - Never hardcode absolute paths in project files. Use relative paths so any user can clone and build the project without modification.
-    - On build errors, call find_build_env first. Use the conda env or Docker container it finds to build. Never install dependencies manually when a project environment exists.
+    - Before building any project, use find_build_env to discover existing build environments, unless the build environment is known.
+    - Avoid installing packages directly to the system. Use existing project-provided environments for all dependency management, e.g. Conda, Docker, Podman, etc.
+    - Always ask the user first before installing packages directly to the system or creating a new environment.
 
     C++ Rules:
     - Never use bare 'int' or 'uint'. Always use explicitly sized types:

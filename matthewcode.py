@@ -145,8 +145,8 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "bash_run",
-            "description": "Execute a shell command and return its output. "
-            "Use for running tests, builds, git commands, or inspecting system state.",
+            "description": "Execute a non-interactive shell command and return its stdout and stderr. "
+            "stdin is closed. Commands requiring user input will receive EOF and fail.",
             "parameters": {
                 "type": "object",
                 "properties": {
