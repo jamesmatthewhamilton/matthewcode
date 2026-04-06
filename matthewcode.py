@@ -98,12 +98,14 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "file_read",
-            "description": "Read the contents of a file. Use this to examine code or "
-            "understand existing file structure before making changes.",
+            "description": "Read the contents of a file. Returns lines with line numbers. "
+            "Use offset and limit to read specific sections of large files.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Absolute or relative file path to read"}
+                    "path": {"type": "string", "description": "Absolute or relative file path to read"},
+                    "offset": {"type": "integer", "description": "Starting line number (1-based, default: 1)"},
+                    "limit": {"type": "integer", "description": "Number of lines to read (default: all)"},
                 },
                 "required": ["path"],
             },
@@ -241,16 +243,26 @@ def is_protected_path(path: str, protected: list) -> bool:
 # --- Tool implementations ---
 
 
-def tool_file_read(path):
+def tool_file_read(path, offset=None, limit=None):
     path = os.path.expanduser(path)
     if not os.path.isfile(path):
         return f"Error: File not found: {path}"
     try:
         with open(path, "r") as f:
-            content = f.read()
-        if len(content) > 100_000:
-            return content[:100_000] + f"\n\n[Truncated: file is {len(content)} chars]"
-        return content
+            lines = f.readlines()
+        total = len(lines)
+        start = max((offset or 1) - 1, 0)
+        end = start + limit if limit else total
+        selected = lines[start:end]
+        # Format with line numbers
+        numbered = "".join(f"{start + i + 1:4d}\t{line}" for i, line in enumerate(selected))
+        if len(numbered) > 100_000:
+            numbered = numbered[:100_000] + f"\n\n[Truncated at 100K chars]"
+        info = f"[{path}: {total} lines total"
+        if offset or limit:
+            info += f", showing lines {start + 1}-{start + len(selected)}"
+        info += "]"
+        return f"{info}\n{numbered}"
     except Exception as e:
         return f"Error reading file: {e}"
 
@@ -496,7 +508,7 @@ def tool_find_build_env(path="."):
 
 
 TOOL_DISPATCH = {
-    "file_read": lambda a: tool_file_read(a["path"]),
+    "file_read": lambda a: tool_file_read(a["path"], a.get("offset"), a.get("limit")),
     "file_write": lambda a: tool_file_write(a["path"], a["content"]),
     "file_edit": lambda a: tool_file_edit(a["path"], a["old_text"], a["new_text"]),
     "bash_run": lambda a: tool_bash_run(a["command"], a.get("timeout", 120)),
