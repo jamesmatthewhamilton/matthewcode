@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import random
 import time
 
 # Add common/python to path for llm_connections import
@@ -14,6 +15,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "common", "python"))
 
 from llm_connections import LLMConnection
+from res.thinking import WORDS as THINKING_WORDS
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.theme import Theme
@@ -732,9 +734,9 @@ def main():
     total_chars = sum(len(str(m.get("content", ""))) for m in messages)
     ctx_tokens = total_chars // 4
     if num_ctx:
-        ctx_display = f"~{ctx_tokens}/{num_ctx} tokens (estimated)"
+        ctx_display = f"{ctx_tokens}/{num_ctx} tokens (estimated)"
     else:
-        ctx_display = f"~{ctx_tokens} tokens (estimated)"
+        ctx_display = f"{ctx_tokens} tokens (estimated)"
     # Splash screen — spitting llama animation
     LLAMA_FRAMES = [
         # Frame 1: mouth open
@@ -1003,15 +1005,26 @@ def main():
                     print(f"{RED}Failed to generate summary.{RESET}")
                     continue
 
-                # Rebuild messages: system + summary
+                # Rebuild messages: system + summary + last N user messages
+                num_kept = CONFIG.get("pipeline_rebirth", {}).get("num_messages_kept", 5)
+                # Keep last N messages of any role (user, assistant, tool)
+                # Skip the rebirth prompt we just added
+                recent_msgs = []
+                for msg in reversed(messages):
+                    if msg.get("content", "").startswith("Summarize this"):
+                        continue
+                    recent_msgs.insert(0, msg)
+                    if len(recent_msgs) >= num_kept:
+                        break
                 messages = [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "system", "content": f"Previous conversation summary:\n{summary_text}"},
-                ]
+                    {"role": "system", "content": f"The following {len(recent_msgs)} message(s) are the most recent user requests from before the conversation was compressed:"},
+                ] + recent_msgs
                 ctx_tokens = 0
                 save_history(messages, session_file)
                 print(f"{DIM}Rebirth complete: {old_count} messages → {len(messages)}, "
-                      f"~{old_tokens} tokens → ~{len(summary_text)} chars{RESET}")
+                      f"{old_tokens} tokens → {len(summary_text)} chars{RESET}")
                 render_markdown(summary_text)
             except Exception as e:
                 print(f"{RED}Rebirth failed: {e}{RESET}")
@@ -1103,17 +1116,26 @@ def main():
                 full_content = ""
                 tool_calls = []
                 llama_frames = ["🦙      ", "  🦙    ", "    🦙  "]
+                bubble_frames = ["·", "∘", "○", "◎", "◉", "◎", "○", "∘"]
+                thinking_word = random.choice(THINKING_WORDS)
+                next_word_change = time.time() + random.uniform(5, 20)
+                start_time = time.time()
                 frame_idx = 0
                 chunk_count = 0
                 for chunk in response:
                     if chunk.text:
                         full_content += chunk.text
                         chunk_count += 1
-                        if chunk_count % 3 == 0:  # animate every 3 chunks
+                        if chunk_count % 3 == 0:
                             frame = llama_frames[frame_idx % len(llama_frames)]
-                            sys.stdout.write(f"\r{frame}")
+                            bubble = bubble_frames[int(time.time() - start_time) % len(bubble_frames)]
+                            elapsed = int(time.time() - start_time)
+                            sys.stdout.write(f"\r{frame}{bubble} {thinking_word}... ({elapsed}s, {chunk_count} tokens)   ")
                             sys.stdout.flush()
                             frame_idx += 1
+                            if time.time() >= next_word_change:
+                                thinking_word = random.choice(THINKING_WORDS)
+                                next_word_change = time.time() + random.uniform(5, 20)
                     if chunk.tool_calls:
                         tool_calls.extend(chunk.tool_calls)
 
@@ -1127,12 +1149,10 @@ def main():
                 if response.prompt_tokens:
                     ctx_tokens = max(ctx_tokens, response.prompt_tokens)
 
-                # Clear the llama animation and render the response
-                if full_content:
-                    sys.stdout.write("\r\033[K")  # clear the animation line
-                    render_markdown(full_content)
+                # Clear the llama animation
+                sys.stdout.write("\r\033[K")
 
-                # No native tool calls — try fallback text parsing
+                # No native tool calls — try fallback text parsing BEFORE rendering
                 if not tool_calls and full_content:
                     fallback = parse_tool_calls_from_text(full_content)
                     if fallback:
@@ -1155,9 +1175,10 @@ def main():
                             break
                         continue
 
-                # No tool calls at all — done
+                # No tool calls at all — done, render the response
                 if not tool_calls:
                     if full_content:
+                        render_markdown(full_content)
                         messages.append({"role": "assistant", "content": full_content})
                     save_history(messages, session_file)
                     break
@@ -1199,7 +1220,12 @@ def main():
                             break
 
                     if name in TOOL_DISPATCH:
+                        tool_start = time.time()
                         result = TOOL_DISPATCH[name](tc_args)
+                        tool_elapsed = time.time() - tool_start
+                        result_chars = len(result)
+                        result_tokens_est = result_chars // 4
+                        print(f"{DIM}  → {result_chars} chars ({result_tokens_est} tokens) in {tool_elapsed:.1f}s{RESET}")
                     else:
                         result = f"Error: Unknown tool '{name}'"
                     messages.append({"role": "tool", "tool_call_id": call_id, "content": result})

@@ -40,19 +40,22 @@ pipeline_main:
     - Be concise. No unnecessary explanations.
 
     Git Rules:
-    - Never commit code unless the user explicitly requests it.
+    - Never commit code unless the user explicitly requests it
 
     DevOps Rules:
-    - Never hardcode absolute paths in project files. Use relative paths so any user can clone and build the project without modification.
-    - Before building any project, use find_build_env to discover existing build environments, unless the build environment is known.
-    - Avoid installing packages directly to the system. Use existing project-provided environments for all dependency management, e.g. Conda, Docker, Podman, etc.
-    - Always ask the user first before installing packages directly to the system or creating a new environment.
+    - Never hardcode absolute paths in project files. Use relative paths so any user can clone and build the project without modification
+    - Before building any project, use find_build_env to discover existing build environments, unless the build environment is known
+    - Avoid installing packages directly to the system. Use existing project-provided environments for all dependency management, e.g. Conda, Docker, Podman, etc
+    - Always ask the user first before installing packages directly to the system or creating a new environment
 
     C++ Rules:
     - Never use bare 'int' or 'uint'. Always use explicitly sized types:
       int8_t, int16_t, int32_t, int64_t, uint8_t, uint16_t, uint32_t, uint64_t
     - Use scientific iterator naming in for-loops:
-      'ii' for the outer loop, 'jj' for the first nested loop, 'kk' for the second nested loop.
+      'ii' for the outer loop, 'jj' for the first nested loop, 'kk' for the second nested loop
+
+    Bash Rules:
+    - Always write bash that is POSIX shell compliant (IEEE Std 1003.1)
 
   user_prompt: |
     {user_input}
@@ -65,19 +68,21 @@ pipeline_session_resume:
 
 # ── Pipeline: Rebirth (context compression)
 pipeline_rebirth:
+  num_messages_kept: 5
   user_prompt: |
     Summarize this conversation organized by project. For each project
     directory that was worked on, create a section with this format:
 
-    ## ~/Repos/ProjectName/
+    ## /Users/username/Repos/ProjectName/
     Summary: Brief description of the project and what was accomplished.
     Decisions: Key decisions, preferences, or constraints the user stated.
     Errors: Any errors encountered and how they were resolved.
     In progress: Current task if unfinished.
     Files written or edited:
-      - hello.cpp — C++ hello world program. Created from scratch.
-      - GNUmakefile — build config. Edited to switch from g++ to clang++.
+      - /Users/username/Repos/ProjectName/hello.cpp — C++ hello world program. Created from scratch.
+      - /Users/username/Repos/ProjectName/GNUmakefile — build config. Edited to switch from g++ to clang++.
 
+    Use FULL ABSOLUTE PATHS for all project directories and files.
     Only list files that were written or edited, not every file that was read.
     Include ALL projects that were worked on, each as its own section.
 
