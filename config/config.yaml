@@ -4,6 +4,10 @@ max_bash_output: 30000
 verbose: false
 default_provider: default
 
+loop_detection:
+  enabled: true
+  consecutive_threshold: 3
+
 rules:
   protected_paths:
     - ~/.*           # all hidden dirs/files (ssh, aws, gnupg, etc.)
@@ -75,6 +79,7 @@ pipeline_rebirth:
 
     ## /Users/username/Repos/ProjectName/
     Summary: Brief description of the project and what was accomplished.
+    Build: Step-by-step commands to build this project from scratch. If not yet determined, write "Not yet determined."
     Decisions: Key decisions, preferences, or constraints the user stated.
     Errors: Any errors encountered and how they were resolved.
     In progress: Current task if unfinished.

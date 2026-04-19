@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(SCRIPT_DIR, "common", "python"))
 
 from llm_connections import LLMConnection
 from res.thinking import WORDS as THINKING_WORDS
+from res.loop_detection import LoopDetector, LOOP_WARNING
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.theme import Theme
@@ -73,6 +74,14 @@ def load_providers():
     if "llm-providers" in CONFIG:
         LLMConnection.load(CONFIG_FILE)
 MAX_BASH_OUTPUT = CONFIG.get("max_bash_output", 30_000)
+
+
+def make_loop_detector() -> LoopDetector:
+    cfg = CONFIG.get("loop_detection", {})
+    return LoopDetector(
+        threshold=cfg.get("consecutive_threshold", 3),
+        enabled=cfg.get("enabled", True),
+    )
 
 PROMPT_VARS = {
     "home_dir": os.path.expanduser("~"),
@@ -836,6 +845,7 @@ def main():
         formatted_input = get_prompt("pipeline_main", "user_prompt", user_input=user_input)
         messages.append({"role": "user", "content": formatted_input})
 
+        detector = make_loop_detector()
         for _iter in range(max_iters):
             try:
                 response = client.chat(messages, tools=TOOLS, stream=True)
@@ -859,6 +869,9 @@ def main():
                         for name, tc_args in fallback:
                             print(f"[{name}: {_tool_summary(name, tc_args)}]", file=sys.stderr)
                             result = TOOL_DISPATCH[name](tc_args)
+                            if detector.record(name, tc_args, result):
+                                result += LOOP_WARNING.format(name=name, count=detector.threshold)
+                                detector.reset()
                             messages.append({"role": "tool", "content": result})
                         continue
 
@@ -888,6 +901,9 @@ def main():
                         result = TOOL_DISPATCH[name](tc_args)
                     else:
                         result = f"Error: Unknown tool '{name}'"
+                    if detector.record(name, tc_args, result):
+                        result += LOOP_WARNING.format(name=name, count=detector.threshold)
+                        detector.reset()
                     messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
 
             except Exception as e:
@@ -1120,6 +1136,7 @@ def main():
         messages.append({"role": "user", "content": formatted_input})
 
         # Agent loop
+        detector = make_loop_detector()
         for _iter in range(max_iters):
             try:
                 # Use llm_connections for the chat call
@@ -1182,6 +1199,9 @@ def main():
                                     rejected = True
                                     break
                             result = TOOL_DISPATCH[name](tc_args)
+                            if detector.record(name, tc_args, result):
+                                result += LOOP_WARNING.format(name=name, count=detector.threshold)
+                                detector.reset()
                             messages.append({"role": "tool", "content": result})
                         if rejected:
                             break
@@ -1240,6 +1260,10 @@ def main():
                         print(f"{DIM}  → {result_chars} chars ({result_tokens_est} tokens) in {tool_elapsed:.1f}s{RESET}")
                     else:
                         result = f"Error: Unknown tool '{name}'"
+                    if detector.record(name, tc_args, result):
+                        print(f"{YELLOW}  ⚠ loop detected — nudging model{RESET}")
+                        result += LOOP_WARNING.format(name=name, count=detector.threshold)
+                        detector.reset()
                     messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
 
                     if args.verbose:
