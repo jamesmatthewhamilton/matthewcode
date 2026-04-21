@@ -108,14 +108,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "file_read",
-            "description": "Read the contents of a file. Returns lines with line numbers. "
-            "Use offset and limit to read specific sections of large files.",
+            "description": "Read the contents of a file.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Absolute or relative file path to read"},
-                    "offset": {"type": "integer", "description": "Starting line number (1-based, default: 1)"},
-                    "limit": {"type": "integer", "description": "Number of lines to read (default: all)"},
+                    "path": {"type": "string", "description": "Absolute or relative file path to read"}
                 },
                 "required": ["path"],
             },
@@ -142,8 +139,7 @@ TOOLS = [
         "function": {
             "name": "file_edit",
             "description": "Edit an existing file by replacing a specific text block with new text. "
-            "The old_text must match exactly as it appears in the file. "
-            "Always read the file first to get the exact text.",
+            "The old_text must match exactly as it appears in the file.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -223,8 +219,7 @@ TOOLS = [
         "function": {
             "name": "find_build_env",
             "description": "Search a project for build environments: conda environment files, "
-            "Dockerfiles, docker-compose, and CI/CD configs (GitLab, GitHub Actions, Jenkins, Travis, CircleCI). "
-            "Use this on build errors before attempting manual fixes.",
+            "Dockerfiles, docker-compose, and CI/CD configs (GitLab, GitHub Actions, Jenkins, Travis, CircleCI).",
             "parameters": {
                 "type": "object",
                 "properties": {

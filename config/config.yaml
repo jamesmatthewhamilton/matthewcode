@@ -25,10 +25,6 @@ pipeline_main:
     - Home directory: {home_dir}
     - Working directory: {working_dir}
 
-    You have these tools: file_read, file_write, file_edit, bash_run, dir_list, file_find, file_grep, find_build_env.
-    When the user asks you to create, read, edit, or run something, CALL THE TOOL IMMEDIATELY.
-    Do not print the tool call as text. Do not ask the user to run commands. Execute them yourself.
-
     Workflow:
     1. Think briefly about what to do (1-2 sentences max)
     2. Call the appropriate tool(s)
@@ -41,7 +37,6 @@ pipeline_main:
     - For file_edit: old_text must match EXACTLY what is in the file
     - If bash_run fails, read the error, fix the issue, and retry
     - Never delete files unless explicitly asked
-    - Do not repeat yourself. If you already tried something and it failed, try a DIFFERENT approach
     - Be concise. No unnecessary explanations.
 
     Git Rules:
