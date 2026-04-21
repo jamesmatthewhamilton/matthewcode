@@ -507,15 +507,24 @@ def tool_find_build_env(path="."):
     return "\n".join(output)
 
 
+def _safe(name, fn):
+    def call(a):
+        try:
+            return fn(a)
+        except KeyError as e:
+            return f"Error: Tool call {name} is missing required argument {e}. Retry with the argument included."
+    return call
+
+
 TOOL_DISPATCH = {
-    "file_read": lambda a: tool_file_read(a["path"]),
-    "file_write": lambda a: tool_file_write(a["path"], a["content"]),
-    "file_edit": lambda a: tool_file_edit(a["path"], a["old_text"], a["new_text"]),
-    "bash_run": lambda a: tool_bash_run(a["command"], a.get("timeout", 120)),
-    "dir_list": lambda a: tool_dir_list(a.get("path", ".")),
-    "file_find": lambda a: tool_file_find(a["pattern"], a.get("path", ".")),
-    "file_grep": lambda a: tool_file_grep(a["pattern"], a.get("path", "."), a.get("glob")),
-    "find_build_env": lambda a: tool_find_build_env(a.get("path", ".")),
+    "file_read": _safe("file_read", lambda a: tool_file_read(a["path"])),
+    "file_write": _safe("file_write", lambda a: tool_file_write(a["path"], a["content"])),
+    "file_edit": _safe("file_edit", lambda a: tool_file_edit(a["path"], a["old_text"], a["new_text"])),
+    "bash_run": _safe("bash_run", lambda a: tool_bash_run(a["command"], a.get("timeout", 120))),
+    "dir_list": _safe("dir_list", lambda a: tool_dir_list(a.get("path", "."))),
+    "file_find": _safe("file_find", lambda a: tool_file_find(a["pattern"], a.get("path", "."))),
+    "file_grep": _safe("file_grep", lambda a: tool_file_grep(a["pattern"], a.get("path", "."), a.get("glob"))),
+    "find_build_env": _safe("find_build_env", lambda a: tool_find_build_env(a.get("path", "."))),
 }
 
 
