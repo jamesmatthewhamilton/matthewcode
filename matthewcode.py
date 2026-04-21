@@ -74,6 +74,7 @@ def load_providers():
     if "llm-providers" in CONFIG:
         LLMConnection.load(CONFIG_FILE)
 MAX_BASH_OUTPUT = CONFIG.get("max_bash_output", 30_000)
+MAX_FILE_READ = CONFIG.get("max_file_read", 50_000)
 
 
 def make_loop_detector() -> LoopDetector:
@@ -252,26 +253,21 @@ def is_protected_path(path: str, protected: list) -> bool:
 # --- Tool implementations ---
 
 
-def tool_file_read(path, offset=None, limit=None):
+def tool_file_read(path):
     path = os.path.expanduser(path)
     if not os.path.isfile(path):
         return f"Error: File not found: {path}"
     try:
         with open(path, "r") as f:
-            lines = f.readlines()
-        total = len(lines)
-        start = max((offset or 1) - 1, 0)
-        end = start + limit if limit else total
-        selected = lines[start:end]
-        # Format with line numbers
-        numbered = "".join(f"{start + i + 1:4d}\t{line}" for i, line in enumerate(selected))
-        if len(numbered) > 100_000:
-            numbered = numbered[:100_000] + f"\n\n[Truncated at 100K chars]"
-        info = f"[{path}: {total} lines total"
-        if offset or limit:
-            info += f", showing lines {start + 1}-{start + len(selected)}"
-        info += "]"
-        return f"{info}\n{numbered}"
+            content = f.read()
+        if len(content) > MAX_FILE_READ:
+            return (
+                f"Error: file_read was NOT run. {path} is {len(content)} chars, "
+                f"which exceeds the limit of {MAX_FILE_READ}. Retry using bash_run "
+                f"with 'sed -n START,ENDp {path}' to read a specific line range, "
+                f"or 'grep PATTERN {path}' to search for text."
+            )
+        return content
     except Exception as e:
         return f"Error reading file: {e}"
 
@@ -517,7 +513,7 @@ def tool_find_build_env(path="."):
 
 
 TOOL_DISPATCH = {
-    "file_read": lambda a: tool_file_read(a["path"], a.get("offset"), a.get("limit")),
+    "file_read": lambda a: tool_file_read(a["path"]),
     "file_write": lambda a: tool_file_write(a["path"], a["content"]),
     "file_edit": lambda a: tool_file_edit(a["path"], a["old_text"], a["new_text"]),
     "bash_run": lambda a: tool_bash_run(a["command"], a.get("timeout", 120)),

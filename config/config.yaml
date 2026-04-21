@@ -1,6 +1,7 @@
 auto_approve: false
 max_iterations: 100
 max_bash_output: 30000
+max_file_read: 50000
 verbose: false
 default_provider: default
 
