@@ -10,9 +10,18 @@ import sys
 import random
 import time
 
-# Add common/python to path for llm_connections import
+# Add llm-connections/python to path. The optional slurm-manipulator nested
+# submodule is added if present (under llm-connections/slurm-manipulator/) or
+# from a sibling working tree at ~/Repos/slurm-manipulator/ (dev fallback).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(SCRIPT_DIR, "common", "python"))
+sys.path.insert(0, os.path.join(SCRIPT_DIR, "llm-connections", "python"))
+for _slurm_path in (
+    os.path.join(SCRIPT_DIR, "llm-connections", "slurm-manipulator", "python"),
+    os.path.expanduser("~/Repos/slurm-manipulator/python"),
+):
+    if os.path.isdir(_slurm_path):
+        sys.path.insert(0, _slurm_path)
+        break
 
 from llm_connections import LLMConnection
 from res.thinking import WORDS as THINKING_WORDS
@@ -68,11 +77,79 @@ def load_config() -> dict:
 CONFIG = load_config()
 
 
+def _resolve_slurm_sessions(yaml_path: str) -> str:
+    """If any provider in yaml_path has 'slurm_session: <name>', spin up the
+    Slurm job, replace the field with 'base_url: <local_tunnel_url>', and
+    return a path to a temp YAML with the rewrite. Otherwise return yaml_path
+    unchanged. Skips silently if the file doesn't exist.
+    """
+    import tempfile
+    import yaml as _yaml
+
+    yaml_path = os.path.expanduser(yaml_path)
+    if not os.path.isfile(yaml_path):
+        return yaml_path
+    with open(yaml_path, "r") as f:
+        cfg = _yaml.safe_load(f) or {}
+
+    providers = cfg.get("llm-providers") or {}
+    refs = {n: p["slurm_session"] for n, p in providers.items()
+            if isinstance(p, dict) and p.get("slurm_session")}
+    if not refs:
+        return yaml_path
+
+    from llm_connections import SlurmSession, connect_ssh
+    from llm_connections.ssh import can_reach
+    SlurmSession.load()  # reads ~/.llm-connections/config.yaml's slurm-sessions: key
+
+    started: dict = {}  # session_name -> SessionHandle (cache to dedupe)
+    for prov_name, sess_name in refs.items():
+        if sess_name not in started:
+            sess = SlurmSession.get(sess_name)
+            ssh = sess._cluster_cfg["ssh"]
+            # Fast pre-flight: 3 TCP attempts to host:22, ~6s max. Bails early
+            # when VPN is down rather than sitting in connect_ssh's retry loop.
+            console.print(f"[info]Pinging {ssh['host']}...[/info]")
+            if not can_reach(ssh["host"], port=22):
+                raise ConnectionError(
+                    f"Cannot reach {ssh['host']}:22 after 3 attempts (~6s). "
+                    f"Are you on the VPN?"
+                )
+            connect_ssh(ssh["user"], ssh["host"], ssh.get("password", ""))
+            existing = sess.peek_existing()
+            if existing is not None:
+                state, job_id = existing
+                console.print(
+                    f"[info]Found existing Slurm job {job_id} ({state}) — reusing.[/info]"
+                )
+            else:
+                console.print(
+                    f"[info]No existing Slurm job for '{sess_name}'; submitting fresh.[/info]"
+                )
+            console.print(f"[info]Starting Slurm session '{sess_name}'...[/info]")
+            started[sess_name] = sess.start()
+        handle = started[sess_name]
+        provider_cfg = providers[prov_name]
+        provider_cfg["base_url"] = handle.local_url
+        provider_cfg.pop("slurm_session", None)
+        provider_cfg.pop("ssh_tunnel", None)  # remove any stale tunnel block
+        console.print(
+            f"[info]Provider '{prov_name}' -> {handle.local_url} "
+            f"(job {handle.job_id}, {handle.gpu_info})[/info]"
+        )
+
+    tf = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+    _yaml.safe_dump(cfg, tf)
+    tf.close()
+    return tf.name
+
+
 def load_providers():
     """Load LLM providers. Called after argparse so --help doesn't wait."""
-    LLMConnection.load()
+    home_yaml = os.path.expanduser("~/.llm-connections/config.yaml")
+    LLMConnection.load(_resolve_slurm_sessions(home_yaml))
     if "llm-providers" in CONFIG:
-        LLMConnection.load(CONFIG_FILE)
+        LLMConnection.load(_resolve_slurm_sessions(CONFIG_FILE))
 MAX_BASH_OUTPUT = CONFIG.get("max_bash_output", 30_000)
 MAX_FILE_READ = CONFIG.get("max_file_read", 50_000)
 
@@ -982,10 +1059,87 @@ def main():
             print(f"  /provider             List available LLM providers")
             print(f"  /provider <name>      Switch to a different provider")
             print(f"  /verbose              Toggle verbose mode")
+            print(f"  /kill-ai              Terminate the active AI (local ollama serve OR Slurm job)")
+            print(f"  /diagnose             Probe the active AI: tunnel, /api/tags, /api/ps, Slurm job")
             continue
         elif user_input == "/verbose":
             args.verbose = not args.verbose
             print(f"{DIM}Verbose: {'on' if args.verbose else 'off'}{RESET}")
+            continue
+        elif user_input == "/diagnose":
+            import time as _time
+            import urllib.error as _urlerr
+            import urllib.request as _urlreq
+
+            cur = LLMConnection._registry.get(args.provider)
+            base_url = getattr(getattr(cur, "_provider", None), "base_url", None)
+            print(f"{DIM}── /diagnose {args.provider} ──{RESET}")
+            print(f"  base_url: {base_url or '(none)'}")
+
+            def _probe(path: str, timeout: float = 5.0):
+                if not base_url:
+                    return ("?", 0.0, "no base_url")
+                url = base_url.rstrip("/") + path
+                t0 = _time.time()
+                try:
+                    with _urlreq.urlopen(url, timeout=timeout) as r:
+                        body = r.read().decode("utf-8", errors="replace")
+                        return (r.status, _time.time() - t0, body[:500])
+                except _urlerr.HTTPError as e:
+                    return (e.code, _time.time() - t0, str(e))
+                except Exception as e:
+                    return ("ERR", _time.time() - t0, f"{type(e).__name__}: {e}")
+
+            for path in ("/api/tags", "/api/ps"):
+                code, dt, body = _probe(path)
+                color = GREEN if code == 200 else RED
+                print(f"  {color}{path:<10} {code} ({dt*1000:.0f}ms){RESET}")
+                if body and code != 200:
+                    print(f"    {DIM}{body}{RESET}")
+                elif body and code == 200 and path == "/api/ps":
+                    # Show loaded models — most useful diagnostic for "why is chat hanging"
+                    print(f"    {DIM}{body}{RESET}")
+
+            from llm_connections import SlurmSession
+            handle = SlurmSession.active_by_local_url(base_url) if base_url else None
+            if handle is not None:
+                print(f"  {DIM}Slurm: cluster={handle.cluster}, job={handle.job_id}, "
+                      f"remote={handle.remote_host}:{handle.remote_port}, gpu={handle.gpu_info}{RESET}")
+                print(f"  {DIM}Check the job manually:{RESET}")
+                print(f"    ssh {handle.ssh_target} 'squeue -j {handle.job_id}; "
+                      f"tail -50 ~/log/{handle.name}-{handle.job_id}.log'")
+            elif base_url and ("localhost" in base_url or "127.0.0.1" in base_url):
+                print(f"  {DIM}Local Ollama; if /api/tags hangs run 'pkill ollama' and restart.{RESET}")
+            continue
+        elif user_input == "/kill-ai":
+            cur = LLMConnection._registry.get(args.provider)
+            base_url = getattr(getattr(cur, "_provider", None), "base_url", None)
+            killed_what = None
+
+            from llm_connections import SlurmSession
+            handle = SlurmSession.active_by_local_url(base_url) if base_url else None
+            if handle is not None:
+                handle.kill()
+                killed_what = f"Slurm job {handle.job_id} on cluster {handle.cluster}"
+            elif base_url and ("localhost" in base_url or "127.0.0.1" in base_url):
+                from llm_connections.llm_providers.ollama import kill_local_server
+                if kill_local_server():
+                    killed_what = "local ollama serve"
+                else:
+                    print(f"{YELLOW}No local 'ollama serve' process was running.{RESET}")
+            else:
+                print(
+                    f"{YELLOW}Provider '{args.provider}' is at {base_url or '?'}; "
+                    f"not managed by matthewcode (not local, no Slurm session).{RESET}"
+                )
+
+            if killed_what:
+                print(f"{GREEN}/kill-ai: terminated {killed_what}.{RESET}")
+                from llm_connections.client import _FailedConnection
+                LLMConnection._registry[args.provider] = _FailedConnection(
+                    args.provider, f"killed by /kill-ai ({killed_what})"
+                )
+                client = LLMConnection.get(args.provider)
             continue
         elif user_input in ("/exit", "/quit"):
             print(f"{DIM}Bye!{RESET}")
