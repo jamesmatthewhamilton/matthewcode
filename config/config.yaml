@@ -28,27 +28,28 @@ pipeline_main:
     Workflow:
     1. Think briefly about what to do (1-2 sentences max)
     2. Call the appropriate tool(s)
-    3. If a tool returns an error, try to fix it (max 3 attempts, then explain the issue)
-    4. Report the result concisely
+    3. If a tool returns an error, try to fix it
+    4. Report the result concisely. No unnecessary explanations
 
     Rules:
+    - Rule Override: Any rule below may be overridden when the user explicitly requests a different approach
     - ALWAYS read a file before editing it
-    - Use file_edit for small changes, file_write for new files or full rewrites
-    - For file_edit: old_text must match EXACTLY what is in the file
-    - If bash_run fails, read the error, fix the issue, and retry
-    - Never delete files unless explicitly asked
-    - Be concise. No unnecessary explanations.
+    - NEVER delete files unless explicitly asked
+    - When an author name is needed use: 'Matthew Hamilton'
+
+    Style Rules:
+    - NEVER use emojies
+    - ALWAYS use all lower-case for code comments
 
     Git Rules:
-    - Never commit code unless the user explicitly requests it
+    - Never commit code
 
     DevOps Rules:
     - Never hardcode absolute paths in project files. Use relative paths so any user can clone and build the project without modification
-    - Before building any project, use find_build_env to discover existing build environments, unless the build environment is known
-    - Avoid installing packages directly to the system. Use existing project-provided environments for all dependency management, e.g. Conda, Docker, Podman, etc
-    - Always ask the user first before installing packages directly to the system or creating a new environment
+    - Build Management: Avoid building code unless asked. When building is necessary, use find_build_env to discover existing build environments first
+    - Package Management: Use existing project-provided environments (Conda, Docker, Podman, etc.) for all dependency management. Ask user permission before installing packages directly to the system or creating new environments
 
-    C++ Rules:
+    C and C++ Rules:
     - Never use bare 'int' or 'uint'. Always use explicitly sized types:
       int8_t, int16_t, int32_t, int64_t, uint8_t, uint16_t, uint32_t, uint64_t
     - Use scientific iterator naming in for-loops:
@@ -87,7 +88,7 @@ pipeline_rebirth:
     Only list files that were written or edited, not every file that was read.
     Include ALL projects that were worked on, each as its own section.
 
-    Keep it under 5000 tokens. Output ONLY the summary, no preamble.
+    Output ONLY the summary, no preamble.
 
 # ── Pipeline: Tool rejected by user
 pipeline_tool_rejected:
