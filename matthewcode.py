@@ -25,7 +25,7 @@ for _slurm_path in (
 
 from llm_connections import LLMConnection
 from res.thinking import WORDS as THINKING_WORDS
-from res.loop_detection import LoopDetector, LOOP_WARNING
+from res.loop_detection import LoopDetector
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.theme import Theme
@@ -109,7 +109,8 @@ def _resolve_slurm_sessions(yaml_path: str) -> str:
             ssh = sess._cluster_cfg["ssh"]
             # Fast pre-flight: 3 TCP attempts to host:22, ~6s max. Bails early
             # when VPN is down rather than sitting in connect_ssh's retry loop.
-            console.print(f"[info]Pinging {ssh['host']}...[/info]")
+            status_text = get_prompt("pipeline_status", "pinging_host", host=ssh['host'])
+            console.print(status_text)
             if not can_reach(ssh["host"], port=22):
                 raise ConnectionError(
                     f"Cannot reach {ssh['host']}:22 after 3 attempts (~6s). "
@@ -119,24 +120,24 @@ def _resolve_slurm_sessions(yaml_path: str) -> str:
             existing = sess.peek_existing()
             if existing is not None:
                 state, job_id = existing
-                console.print(
-                    f"[info]Found existing Slurm job {job_id} ({state}) — reusing.[/info]"
-                )
+                status_text = get_prompt("pipeline_status", "found_existing_job",
+                                        job_id=job_id, state=state)
+                console.print(status_text)
             else:
-                console.print(
-                    f"[info]No existing Slurm job for '{sess_name}'; submitting fresh.[/info]"
-                )
-            console.print(f"[info]Starting Slurm session '{sess_name}'...[/info]")
+                status_text = get_prompt("pipeline_status", "no_existing_job", name=sess_name)
+                console.print(status_text)
+            status_text = get_prompt("pipeline_status", "starting_slurm", name=sess_name)
+            console.print(status_text)
             started[sess_name] = sess.start()
         handle = started[sess_name]
         provider_cfg = providers[prov_name]
         provider_cfg["base_url"] = handle.local_url
         provider_cfg.pop("slurm_session", None)
         provider_cfg.pop("ssh_tunnel", None)  # remove any stale tunnel block
-        console.print(
-            f"[info]Provider '{prov_name}' -> {handle.local_url} "
-            f"(job {handle.job_id}, {handle.gpu_info})[/info]"
-        )
+        status_text = get_prompt("pipeline_status", "provider_ready",
+                                provider=prov_name, url=handle.local_url,
+                                job_id=handle.job_id, gpu=handle.gpu_info)
+        console.print(status_text)
 
     tf = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
     _yaml.safe_dump(cfg, tf)
@@ -164,14 +165,16 @@ def make_loop_detector() -> LoopDetector:
 PROMPT_VARS = {
     "home_dir": os.path.expanduser("~"),
     "working_dir": os.getcwd(),
+    "project_root": os.getcwd(),
 }
+
 
 
 def get_prompt(pipeline: str, prompt_type: str, **extra_vars) -> str:
     """Get a prompt from config. pipeline='pipeline_main', prompt_type='system_prompt'."""
     template = CONFIG.get(pipeline, {}).get(prompt_type, "")
     if not template:
-        return ""
+        raise ValueError(f"Missing prompt: {pipeline}.{prompt_type} not found in config.yaml")
     all_vars = {**PROMPT_VARS, **extra_vars}
     return template.format(**all_vars)
 
@@ -328,20 +331,16 @@ def is_protected_path(path: str, protected: list) -> bool:
 def tool_file_read(path):
     path = os.path.expanduser(path)
     if not os.path.isfile(path):
-        return f"Error: File not found: {path}"
+        return get_prompt("pipeline_tool_errors", "file_not_found", path=path)
     try:
         with open(path, "r") as f:
             content = f.read()
         if len(content) > MAX_FILE_READ:
-            return (
-                f"Error: file_read was NOT run. {path} is {len(content)} chars, "
-                f"which exceeds the limit of {MAX_FILE_READ}. Retry using bash_run "
-                f"with 'sed -n START,ENDp {path}' to read a specific line range, "
-                f"or 'grep PATTERN {path}' to search for text."
-            )
+            return get_prompt("pipeline_tool_errors", "file_read_too_large",
+                            path=path, len_content=len(content), max_limit=MAX_FILE_READ)
         return content
     except Exception as e:
-        return f"Error reading file: {e}"
+        return get_prompt("pipeline_tool_errors", "file_read_error", error=e)
 
 
 def tool_file_write(path, content):
@@ -350,36 +349,36 @@ def tool_file_write(path, content):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w") as f:
             f.write(content)
-        return f"Wrote {len(content)} chars to {path}"
+        return get_prompt("pipeline_tool_success", "file_write", path=path, len_content=len(content))
     except Exception as e:
-        return f"Error writing file: {e}"
+        return get_prompt("pipeline_tool_errors", "file_write_error", error=e)
 
 
 def tool_file_edit(path, old_text, new_text):
     path = os.path.expanduser(path)
     if not os.path.isfile(path):
-        return f"Error: File not found: {path}"
+        return get_prompt("pipeline_tool_errors", "file_not_found", path=path)
     try:
         with open(path, "r") as f:
             content = f.read()
         if old_text in content:
             count = content.count(old_text)
             if count > 1:
-                return f"Error: old_text matches {count} locations. Provide more context."
+                return get_prompt("pipeline_tool_errors", "file_edit_multiple_matches", count=count)
             new_content = content.replace(old_text, new_text, 1)
             with open(path, "w") as f:
                 f.write(new_content)
-            return f"Edited {path} (replaced 1 occurrence)"
+            return get_prompt("pipeline_tool_success", "file_edit", path=path)
         lines = content.split("\n")
         old_lines = old_text.split("\n")
         matcher = difflib.SequenceMatcher(None, lines, old_lines)
         best = matcher.find_longest_match(0, len(lines), 0, len(old_lines))
         if best.size > 0 and best.size >= len(old_lines) * 0.6:
-            return (f"Error: Exact match not found. Closest match at lines "
-                    f"{best.a + 1}-{best.a + best.size}. Read the file and use exact text.")
-        return "Error: old_text not found in file. Read the file first to get exact text."
+            return get_prompt("pipeline_tool_errors", "file_edit_fuzzy_match",
+                            start_line=best.a + 1, end_line=best.a + best.size)
+        return get_prompt("pipeline_tool_errors", "file_edit_not_found")
     except Exception as e:
-        return f"Error editing file: {e}"
+        return get_prompt("pipeline_tool_errors", "file_edit_error", error=e)
 
 
 def tool_bash_run(command, timeout=120):
@@ -396,12 +395,7 @@ def tool_bash_run(command, timeout=120):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
-            return (
-                "Error: Command timed out. This may be because it opened an "
-                "interactive session (e.g., python, node, gdb, ssh). "
-                "All commands must run non-interactively and exit on their own. "
-                "Use flags like -c, --batch, or -e to run commands inline."
-            )
+            return get_prompt("pipeline_tool_errors", "bash_timeout")
         output = ""
         if stdout:
             output += stdout
@@ -415,13 +409,13 @@ def tool_bash_run(command, timeout=120):
             output = output[:MAX_BASH_OUTPUT] + f"\n[truncated at {MAX_BASH_OUTPUT} chars]"
         return output
     except Exception as e:
-        return f"Error running command: {e}"
+        return get_prompt("pipeline_tool_errors", "bash_error", error=e)
 
 
 def tool_dir_list(path):
     path = os.path.expanduser(path or ".")
     if not os.path.isdir(path):
-        return f"Error: Directory not found: {path}"
+        return get_prompt("pipeline_tool_errors", "directory_not_found", path=path)
     try:
         entries = sorted(os.listdir(path))
         result = []
@@ -440,7 +434,7 @@ def tool_file_find(pattern, path="."):
     import fnmatch
     path = os.path.expanduser(path or ".")
     if not os.path.isdir(path):
-        return f"Error: Directory not found: {path}"
+        return get_prompt("pipeline_tool_errors", "directory_not_found", path=path)
     matches = []
     for root, dirs, files in os.walk(path):
         dirs[:] = [d for d in dirs if not d.startswith(".") and d not in
@@ -450,7 +444,7 @@ def tool_file_find(pattern, path="."):
                 matches.append(os.path.join(root, f))
                 if len(matches) >= 50:
                     return "\n".join(matches) + "\n[truncated at 50 results]"
-    return "\n".join(matches) if matches else f"No files matching '{pattern}' found in {path}"
+    return "\n".join(matches) if matches else get_prompt("pipeline_tool_success", "find_no_matches", pattern=pattern, path=path)
 
 
 def tool_file_grep(pattern, path=".", file_glob=None):
@@ -480,7 +474,7 @@ def tool_file_grep(pattern, path=".", file_glob=None):
                             return "\n".join(matches) + "\n[truncated at 50 results]"
         except (OSError, UnicodeDecodeError):
             continue
-    return "\n".join(matches) if matches else f"No matches for '{pattern}' in {path}"
+    return "\n".join(matches) if matches else get_prompt("pipeline_tool_success", "grep_no_matches", pattern=pattern, path=path)
 
 
 def tool_find_build_env(path="."):
@@ -611,11 +605,15 @@ TOOL_DISPATCH = {
 def confirm_tool(name, args):
     if name == "file_write":
         path = args.get("path", "?")
-        print(f"\n{YELLOW}Write to {path} ({len(args.get('content', ''))} chars)?{RESET}")
+        prompt_text = get_prompt("pipeline_confirmations", "file_write_prompt",
+                                path=path, len_content=len(args.get('content', '')))
+        print(f"\n{YELLOW}{prompt_text}{RESET}")
         if os.path.isfile(os.path.expanduser(path)):
-            print(f"{DIM}(file exists, will be overwritten){RESET}")
+            warning_text = get_prompt("pipeline_confirmations", "file_exists_warning")
+            print(f"{DIM}{warning_text}{RESET}")
     elif name == "file_edit":
-        print(f"\n{YELLOW}Edit {args.get('path', '?')}:{RESET}")
+        prompt_text = get_prompt("pipeline_confirmations", "file_edit_prompt", path=args.get('path', '?'))
+        print(f"\n{YELLOW}{prompt_text}{RESET}")
         for line in difflib.unified_diff(
             args.get("old_text", "").splitlines(keepends=True),
             args.get("new_text", "").splitlines(keepends=True),
@@ -947,7 +945,7 @@ def main():
                             print(f"[{name}: {_tool_summary(name, tc_args)}]", file=sys.stderr)
                             result = TOOL_DISPATCH[name](tc_args)
                             if detector.record(name, tc_args, result):
-                                result += LOOP_WARNING.format(name=name, count=detector.threshold)
+                                result += get_prompt("pipeline_loop_detected", "user_prompt", name=name, count=detector.threshold)
                                 detector.reset()
                             messages.append({"role": "tool", "content": result})
                         continue
@@ -977,9 +975,9 @@ def main():
                     if name in TOOL_DISPATCH:
                         result = TOOL_DISPATCH[name](tc_args)
                     else:
-                        result = f"Error: Unknown tool '{name}'"
+                        result = get_prompt("pipeline_tool_errors", "unknown_tool", name=name)
                     if detector.record(name, tc_args, result):
-                        result += LOOP_WARNING.format(name=name, count=detector.threshold)
+                        result += get_prompt("pipeline_loop_detected", "user_prompt", name=name, count=detector.threshold)
                         detector.reset()
                     messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
 
@@ -1354,7 +1352,7 @@ def main():
                                     break
                             result = TOOL_DISPATCH[name](tc_args)
                             if detector.record(name, tc_args, result):
-                                result += LOOP_WARNING.format(name=name, count=detector.threshold)
+                                result += get_prompt("pipeline_loop_detected", "user_prompt", name=name, count=detector.threshold)
                                 detector.reset()
                             messages.append({"role": "tool", "content": result})
                         if rejected:
@@ -1413,10 +1411,10 @@ def main():
                         result_tokens_est = result_chars // 4
                         print(f"{DIM}  → {result_chars} chars ({result_tokens_est} tokens) in {tool_elapsed:.1f}s{RESET}")
                     else:
-                        result = f"Error: Unknown tool '{name}'"
+                        result = get_prompt("pipeline_tool_errors", "unknown_tool", name=name)
                     if detector.record(name, tc_args, result):
                         print(f"{YELLOW}  ⚠ loop detected — nudging model{RESET}")
-                        result += LOOP_WARNING.format(name=name, count=detector.threshold)
+                        result += get_prompt("pipeline_loop_detected", "user_prompt", name=name, count=detector.threshold)
                         detector.reset()
                     messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
 

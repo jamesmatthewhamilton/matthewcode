@@ -7,7 +7,7 @@ default_provider: default
 
 loop_detection:
   enabled: true
-  consecutive_threshold: 3
+  consecutive_threshold: 2
 
 rules:
   protected_paths:
@@ -24,6 +24,7 @@ pipeline_main:
     Environment:
     - Home directory: {home_dir}
     - Working directory: {working_dir}
+    - Project root: {project_root}
 
     Workflow:
     1. Think briefly about what to do (1-2 sentences max)
@@ -69,26 +70,95 @@ pipeline_session_resume:
 
 # ── Pipeline: Rebirth (context compression)
 pipeline_rebirth:
-  num_messages_kept: 5
+  num_messages_kept: 4
   user_prompt: |
     Summarize this conversation organized by project. For each project
     directory that was worked on, create a section with this format:
 
-    ## /Users/username/Repos/ProjectName/
+    ## {project_root}
     Summary: Brief description of the project and what was accomplished.
     Build: Step-by-step commands to build this project from scratch. If not yet determined, write "Not yet determined."
     Decisions: Key decisions, preferences, or constraints the user stated.
     Errors: Any errors encountered and how they were resolved.
     In progress: Current task if unfinished.
     Files written or edited:
-      - /Users/username/Repos/ProjectName/hello.cpp — C++ hello world program. Created from scratch.
-      - /Users/username/Repos/ProjectName/GNUmakefile — build config. Edited to switch from g++ to clang++.
+      - ./hello.cpp — C++ hello world program. Created from scratch.
+      - ./GNUmakefile — build config. Edited to switch from g++ to clang++.
+      - ../other-project/config.py — external file. Modified configuration.
 
-    Use FULL ABSOLUTE PATHS for all project directories and files.
+    Use relative paths from the project root ({project_root}) for all files.
+    Files in the current project: ./file.py
+    Files outside project: ../other-project/file.py
     Only list files that were written or edited, not every file that was read.
     Include ALL projects that were worked on, each as its own section.
 
     Output ONLY the summary, no preamble.
+
+# ── Pipeline: Loop detected
+pipeline_loop_detected:
+  user_prompt: |
+
+    [LOOP DETECTED] You have called `{name}` {count} times in a row with identical arguments and identical results. DO NOT call this tool again with these arguments. Try a different approach, or ask the user for guidance.
+
+# ── Pipeline: Tool error messages
+pipeline_tool_errors:
+  file_not_found: |
+    Error: File not found: {path}
+  file_read_too_large: |
+    Error: file_read was NOT run. {path} is {len_content} chars, which exceeds the limit of {max_limit}. Retry using bash_run with 'sed -n START,ENDp {path}' to read a specific line range, or 'grep PATTERN {path}' to search for text.
+  file_read_error: |
+    Error reading file: {error}
+  file_write_error: |
+    Error writing file: {error}
+  file_edit_multiple_matches: |
+    Error: old_text matches {count} locations. Provide more context.
+  file_edit_fuzzy_match: |
+    Error: Exact match not found. Closest match at lines {start_line}-{end_line}. Read the file and use exact text.
+  file_edit_not_found: |
+    Error: old_text not found in file. Read the file first to get exact text.
+  file_edit_error: |
+    Error editing file: {error}
+  bash_timeout: |
+    Error: Command timed out. This may be because it opened an interactive prompt (like vim) or is waiting for input. Try using a non-interactive version of the command.
+  bash_error: |
+    Error: {error}
+  directory_not_found: |
+    Error: Directory not found: {path}
+  unknown_tool: |
+    Error: Unknown tool '{name}'
+
+# ── Pipeline: Tool success messages
+pipeline_tool_success:
+  file_write: |
+    Wrote {len_content} chars to {path}
+  file_edit: |
+    Edited {path} (replaced 1 occurrence)
+  grep_no_matches: |
+    No matches for '{pattern}' in {path}
+  find_no_matches: |
+    No files matching '{pattern}' found in {path}
+
+# ── Pipeline: User confirmations
+pipeline_confirmations:
+  file_write_prompt: |
+    Write to {path} ({len_content} chars)?
+  file_exists_warning: |
+    (file exists, will be overwritten)
+  file_edit_prompt: |
+    Edit {path}:
+
+# ── Pipeline: Status messages
+pipeline_status:
+  pinging_host: |
+    [info]Pinging {host}...[/info]
+  starting_slurm: |
+    [info]Starting Slurm session '{name}'...[/info]
+  found_existing_job: |
+    [info]Found existing Slurm job {job_id} ({state}) — reusing.[/info]
+  no_existing_job: |
+    [info]No existing Slurm job for '{name}'; submitting fresh.[/info]
+  provider_ready: |
+    [info]Provider '{provider}' -> {url} (job {job_id}, gpu {gpu})[/info]
 
 # ── Pipeline: Tool rejected by user
 pipeline_tool_rejected:
