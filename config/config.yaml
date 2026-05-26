@@ -5,6 +5,12 @@ max_file_read: 50000
 verbose: false
 default_provider: default
 
+# bash commands containing any of these words always require y/N approval,
+# even when --yes / auto_approve is set.
+restricted_bash_commands:
+  - rm
+  - curl
+
 loop_detection:
   enabled: true
   consecutive_threshold: 2

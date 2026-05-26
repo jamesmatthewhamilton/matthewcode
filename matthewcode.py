@@ -346,6 +346,19 @@ def is_protected_path(path: str, protected: list) -> bool:
     return False
 
 
+def is_restricted_bash(name: str, args: dict) -> bool:
+    """True if a bash_run command contains a restricted word. These force a
+    y/N prompt even when --yes / auto_approve is set."""
+    if name != "bash_run":
+        return False
+    import re
+    cmd = args.get("command", "")
+    for word in CONFIG.get("restricted_bash_commands", []):
+        if re.search(rf"\b{re.escape(word)}\b", cmd):
+            return True
+    return False
+
+
 # --- Tool implementations ---
 
 
@@ -623,7 +636,7 @@ TOOL_DISPATCH = {
 # --- Confirmation ---
 
 
-def confirm_tool(name, args):
+def confirm_tool(name, args, restricted=False):
     if name == "file_write":
         path = args.get("path", "?")
         prompt_text = get_prompt("pipeline_confirmations", "file_write_prompt",
@@ -648,6 +661,13 @@ def confirm_tool(name, args):
                 print(f"  {line.rstrip()}")
     elif name == "bash_run":
         print(f"\n{YELLOW}Run: {args.get('command', '?')}{RESET}")
+    if restricted:
+        print(f"{RED}Restricted command — approval required even with --yes.{RESET}")
+        try:
+            return input(f"{BOLD}Run anyway? [y/N] {RESET}").strip().lower() in ("y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
     try:
         return input(f"{BOLD}Allow? [Y/n] {RESET}").strip().lower() in ("", "y", "yes")
     except (EOFError, KeyboardInterrupt):
@@ -1394,8 +1414,9 @@ def main():
                             protected = CONFIG.get("rules", {}).get("protected_paths", [])
                             tool_path = tc_args.get("path", "")
                             is_safe = name in SAFE_TOOLS and not is_protected_path(tool_path, protected)
-                            if not is_safe and not args.yes:
-                                if not confirm_tool(name, tc_args):
+                            restricted = is_restricted_bash(name, tc_args)
+                            if restricted or (not is_safe and not args.yes):
+                                if not confirm_tool(name, tc_args, restricted=restricted):
                                     messages.append({"role": "assistant", "content": get_prompt("pipeline_tool_rejected", "system_prompt")})
                                     rejected = True
                                     break
@@ -1447,8 +1468,9 @@ def main():
                     protected = CONFIG.get("rules", {}).get("protected_paths", [])
                     tool_path = tc_args.get("path", "")
                     is_safe = name in SAFE_TOOLS and not is_protected_path(tool_path, protected)
-                    if not is_safe and not args.yes:
-                        if not confirm_tool(name, tc_args):
+                    restricted = is_restricted_bash(name, tc_args)
+                    if restricted or (not is_safe and not args.yes):
+                        if not confirm_tool(name, tc_args, restricted=restricted):
                             messages.append({"role": "tool", "tool_call_id": call_id, "content": get_prompt("pipeline_tool_rejected", "system_prompt")})
                             break
 
