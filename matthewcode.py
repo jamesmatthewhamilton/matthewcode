@@ -64,6 +64,17 @@ def render_markdown(text: str):
 HISTORY_DIR = os.path.expanduser("~/.matthewcode")
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config", "config.yaml")
 
+SESSION_DIR_KEY = os.getcwd()  # directory matthewcode was launched in
+
+
+def _encode_path(path):
+    # emacs ~/.emacs.d/backup convention: escape '!' then '/' -> '!'
+    return os.path.abspath(path).replace("!", "!!").replace("/", "!")
+
+
+def session_path(name="last_session"):
+    return os.path.join(HISTORY_DIR, f"{_encode_path(SESSION_DIR_KEY)}!{name}.json")
+
 def load_config() -> dict:
     """Load app config from config.yaml and LLM providers from global config."""
     import yaml
@@ -808,16 +819,34 @@ def main():
         sys.exit(1)
 
     session_name = None
+    resume_existing = False
     if args.resume_name:
         session_name = args.resume_name
-        session_file = os.path.join(HISTORY_DIR, f"{session_name}.json")
+        session_file = session_path(session_name)
         if not os.path.isfile(session_file):
             print(f"{DIM}Created new session '{session_name}'{RESET}")
     else:
-        session_file = os.path.join(HISTORY_DIR, "last_session.json")
+        # one-time migration of the legacy flat last_session.json into the
+        # current directory's per-dir slot.
+        legacy = os.path.join(HISTORY_DIR, "last_session.json")
+        if os.path.isfile(legacy) and not os.path.isfile(session_path()):
+            os.makedirs(HISTORY_DIR, exist_ok=True)
+            os.rename(legacy, session_path())
+        session_file = session_path()
+        # Starting fresh while a last session exists for this directory would
+        # silently overwrite it on the first save. Guard against that. Gated on
+        # an interactive TTY so pipe mode doesn't consume the piped prompt.
+        if not args.resume and sys.stdin.isatty() and os.path.isfile(session_file):
+            try:
+                answer = input(f"{YELLOW}Last session exists for this directory. Overwrite with new session? [y/N] {RESET}").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = ""
+            if answer not in ("y", "yes"):
+                resume_existing = True
+                print(f"{DIM}Keeping existing session.{RESET}")
 
     messages = []
-    if args.resume or args.resume_name:
+    if args.resume or args.resume_name or resume_existing:
         messages = load_history(session_file)
         if messages:
             messages = sanitize_messages(messages)
@@ -1060,6 +1089,7 @@ def main():
             print(f"  /help                 Show this help")
             print(f"  /exit, /quit          Exit MatthewCode")
             print(f"  /clear                Reset conversation")
+            print(f"  /history              View raw session JSON in less (from the bottom)")
             print(f"  /rebirth              Compress context via LLM summary")
             print(f"  /name <name>          Save/name this session")
             print(f"  /session              List saved sessions")
@@ -1067,7 +1097,7 @@ def main():
             print(f"  /provider             List available LLM providers")
             print(f"  /provider <name>      Switch to a different provider")
             print(f"  /verbose              Toggle verbose mode")
-            print(f"  /kill-ai              Terminate the active AI (local ollama serve OR Slurm job)")
+            print(f"  /kill-model           Terminate the active AI (local ollama serve OR Slurm job)")
             print(f"  /diagnose             Probe the active AI: tunnel, /api/tags, /api/ps, Slurm job")
             continue
         elif user_input == "/verbose":
@@ -1119,7 +1149,7 @@ def main():
             elif base_url and ("localhost" in base_url or "127.0.0.1" in base_url):
                 print(f"  {DIM}Local Ollama; if /api/tags hangs run 'pkill ollama' and restart.{RESET}")
             continue
-        elif user_input == "/kill-ai":
+        elif user_input == "/kill-model":
             cur = LLMConnection._registry.get(args.provider)
             base_url = getattr(getattr(cur, "_provider", None), "base_url", None)
             killed_what = None
@@ -1142,7 +1172,7 @@ def main():
                 )
 
             if killed_what:
-                print(f"{GREEN}/kill-ai: terminated {killed_what}.{RESET}")
+                print(f"{GREEN}/kill-model: terminated {killed_what}.{RESET}")
                 # Don't mark provider as permanently failed - check connectivity on next use
             continue
         elif user_input in ("/exit", "/quit"):
@@ -1151,9 +1181,21 @@ def main():
         elif user_input == "/clear":
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             session_name = None
-            session_file = os.path.join(HISTORY_DIR, "last_session.json")
+            session_file = session_path()
             ctx_tokens = 0
             print(f"{DIM}Conversation cleared.{RESET}")
+            continue
+        elif user_input == "/history":
+            import tempfile
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+                json.dump(messages, tf, indent=2, default=str)
+                tmp = tf.name
+            try:
+                subprocess.run(["less", "+G", tmp])
+            except FileNotFoundError:
+                print(f"{RED}'less' not found on PATH.{RESET}")
+            finally:
+                os.unlink(tmp)
             continue
         elif user_input == "/rebirth":
             if len(messages) <= 2:
@@ -1220,7 +1262,7 @@ def main():
             if not new_name:
                 print(f"{RED}Usage: /name <session_name>{RESET}")
                 continue
-            new_file = os.path.join(HISTORY_DIR, f"{new_name}.json")
+            new_file = session_path(new_name)
             if os.path.isfile(new_file) and new_name != session_name:
                 try:
                     answer = input(f"{YELLOW}Session '{new_name}' exists. Overwrite? [y/N] {RESET}").strip().lower()
@@ -1243,13 +1285,14 @@ def main():
             continue
         elif user_input == "/sessions" or user_input == "/session":
             os.makedirs(HISTORY_DIR, exist_ok=True)
-            sessions = sorted(f[:-5] for f in os.listdir(HISTORY_DIR) if f.endswith(".json"))
+            prefix = f"{_encode_path(SESSION_DIR_KEY)}!"
+            sessions = sorted(f[len(prefix):-5] for f in os.listdir(HISTORY_DIR)
+                              if f.startswith(prefix) and f.endswith(".json"))
             if sessions:
                 print(f"{DIM}Saved sessions:{RESET}")
                 for s in sessions:
-                    marker = f" {CYAN}<- active{RESET}" if s == session_name else ""
-                    fpath = os.path.join(HISTORY_DIR, f"{s}.json")
-                    msgs = load_history(fpath)
+                    marker = f" {CYAN}<- active{RESET}" if s == (session_name or "last_session") else ""
+                    msgs = load_history(session_path(s))
                     print(f"  {s} ({len(msgs)} messages){marker}")
             else:
                 print(f"{DIM}No saved sessions.{RESET}")
@@ -1263,7 +1306,7 @@ def main():
             save_history(messages, session_file)
             # Switch to new session
             session_name = new_session
-            session_file = os.path.join(HISTORY_DIR, f"{session_name}.json")
+            session_file = session_path(session_name)
             if os.path.isfile(session_file):
                 messages = load_history(session_file)
                 messages = sanitize_messages(messages)
