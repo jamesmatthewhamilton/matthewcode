@@ -149,16 +149,11 @@ pipeline_confirmations:
 
 # ── Pipeline: Status messages
 pipeline_status:
-  pinging_host: |
-    [info]Pinging {host}...[/info]
-  starting_slurm: |
-    [info]Starting Slurm session '{name}'...[/info]
-  found_existing_job: |
-    [info]Found existing Slurm job {job_id} ({state}) — reusing.[/info]
-  no_existing_job: |
-    [info]No existing Slurm job for '{name}'; submitting fresh.[/info]
-  provider_ready: |
-    [info]Provider '{provider}' -> {url} (job {job_id}, gpu {gpu})[/info]
+  pinging_host: "[info]Pinging {host}...[/info]"
+  starting_slurm: "[info]Starting Slurm session '{name}'...[/info]"
+  found_existing_job: "[info]Found existing Slurm job {job_id} ({state}) — reusing.[/info]"
+  no_existing_job: "[info]No existing Slurm job for '{name}'; submitting fresh.[/info]"
+  provider_ready: "[info]Provider '{provider}' -> {url} (job {job_id}, gpu {gpu})[/info]"
 
 # ── Pipeline: Tool rejected by user
 pipeline_tool_rejected:

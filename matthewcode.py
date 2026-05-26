@@ -77,7 +77,7 @@ def load_config() -> dict:
 CONFIG = load_config()
 
 
-def _resolve_slurm_sessions(yaml_path: str) -> str:
+def _resolve_slurm_sessions(yaml_path: str, provider_filter: str = None) -> str:
     """If any provider in yaml_path has 'slurm_session: <name>', spin up the
     Slurm job, replace the field with 'base_url: <local_tunnel_url>', and
     return a path to a temp YAML with the rewrite. Otherwise return yaml_path
@@ -93,8 +93,18 @@ def _resolve_slurm_sessions(yaml_path: str) -> str:
         cfg = _yaml.safe_load(f) or {}
 
     providers = cfg.get("llm-providers") or {}
-    refs = {n: p["slurm_session"] for n, p in providers.items()
-            if isinstance(p, dict) and p.get("slurm_session")}
+    # If provider_filter is specified, only process that provider
+    if provider_filter:
+        if provider_filter not in providers:
+            return yaml_path
+        provider_config = providers[provider_filter]
+        if not (isinstance(provider_config, dict) and provider_config.get("slurm_session")):
+            return yaml_path
+        refs = {provider_filter: provider_config["slurm_session"]}
+    else:
+        refs = {n: p["slurm_session"] for n, p in providers.items()
+                if isinstance(p, dict) and p.get("slurm_session")}
+
     if not refs:
         return yaml_path
 
@@ -145,12 +155,12 @@ def _resolve_slurm_sessions(yaml_path: str) -> str:
     return tf.name
 
 
-def load_providers():
+def load_providers(provider_name=None):
     """Load LLM providers. Called after argparse so --help doesn't wait."""
     home_yaml = os.path.expanduser("~/.llm-connections/config.yaml")
-    LLMConnection.load(_resolve_slurm_sessions(home_yaml))
+    LLMConnection.load(_resolve_slurm_sessions(home_yaml, provider_name))
     if "llm-providers" in CONFIG:
-        LLMConnection.load(_resolve_slurm_sessions(CONFIG_FILE))
+        LLMConnection.load(_resolve_slurm_sessions(CONFIG_FILE, provider_name))
 MAX_BASH_OUTPUT = CONFIG.get("max_bash_output", 30_000)
 MAX_FILE_READ = CONFIG.get("max_file_read", 50_000)
 
@@ -788,7 +798,7 @@ def main():
     args = parser.parse_args()
 
     # Load providers after argparse so --help is instant
-    load_providers()
+    load_providers(args.provider)
 
     # Get LLM connection from registry
     try:
@@ -1133,11 +1143,7 @@ def main():
 
             if killed_what:
                 print(f"{GREEN}/kill-ai: terminated {killed_what}.{RESET}")
-                from llm_connections.client import _FailedConnection
-                LLMConnection._registry[args.provider] = _FailedConnection(
-                    args.provider, f"killed by /kill-ai ({killed_what})"
-                )
-                client = LLMConnection.get(args.provider)
+                # Don't mark provider as permanently failed - check connectivity on next use
             continue
         elif user_input in ("/exit", "/quit"):
             print(f"{DIM}Bye!{RESET}")
