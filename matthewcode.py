@@ -435,12 +435,18 @@ def tool_bash_run(command, timeout=120):
             output += stdout
         if stderr:
             output += ("\n" if output else "") + stderr
-        if not output:
-            output = "(no output)"
-        if proc.returncode != 0:
-            output += f"\n[exit code: {proc.returncode}]"
+        rc = proc.returncode
+        # Truncate the command's own output first so the exit-code marker below
+        # is never cut off.
         if len(output) > MAX_BASH_OUTPUT:
             output = output[:MAX_BASH_OUTPUT] + f"\n[truncated at {MAX_BASH_OUTPUT} chars]"
+        if not output:
+            # Give silent success an explicit signal so the model doesn't
+            # misread it as failure and re-probe in a loop.
+            output = ("(no output, exit 0 — command succeeded)" if rc == 0
+                      else f"(no output)\n[exit code: {rc}]")
+        else:
+            output += f"\n[exit code: {rc}]"
         return output
     except Exception as e:
         return get_prompt("pipeline_tool_errors", "bash_error", error=e)
