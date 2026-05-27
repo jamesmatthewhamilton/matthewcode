@@ -733,30 +733,30 @@ def load_history(session_file):
 
 
 def sanitize_messages(messages: list) -> list:
-    """Fix corrupted message history from interrupted sessions.
+    """Fix corrupted history so it satisfies strict OpenAI/litellm tool-call
+    pairing (Ollama is lenient about this; litellm is not).
 
-    Rules:
-    - Every tool_calls in assistant must have matching tool results after it
-    - Arguments in tool_calls must be dicts, not strings
-    - No trailing assistant messages with empty content and no tool_calls
-    - Messages must have 'role' and 'content'
+    - Drop messages with no 'role'.
+    - Coerce tool_calls arguments from JSON strings to dicts.
+    - Forward: an assistant 'tool_calls' must be answered by one 'tool' message
+      per call id, immediately following. If incomplete, drop the tool_calls
+      (keeping the assistant's text if any) and discard the partial results.
+    - Backward: a 'tool' message with no matching preceding assistant tool_calls
+      is an orphan and is dropped — anywhere in the list, not just the tail.
+    - Drop a trailing assistant with empty content and no tool_calls.
     """
     if not messages:
         return messages
 
-    cleaned = []
-    removed = 0
+    original_len = len(messages)
+
+    # Pass 1: drop role-less messages; coerce string tool-call arguments.
+    normalized = []
     for msg in messages:
-        # Skip messages missing required fields
         if "role" not in msg:
-            removed += 1
             continue
-
         m = dict(msg)
-
-        # Fix string arguments in tool_calls
-        if "tool_calls" in m:
-            fixed_calls = []
+        if m.get("tool_calls"):
             for tc in m["tool_calls"]:
                 func = tc.get("function", {})
                 args = func.get("arguments", {})
@@ -765,42 +765,54 @@ def sanitize_messages(messages: list) -> list:
                         func["arguments"] = json.loads(args)
                     except json.JSONDecodeError:
                         func["arguments"] = {}
-                fixed_calls.append(tc)
-            m["tool_calls"] = fixed_calls
+        normalized.append(m)
 
-        cleaned.append(m)
-
-    # Remove trailing incomplete messages (assistant/tool without a following user)
-    while len(cleaned) > 1 and cleaned[-1]["role"] in ("assistant", "tool"):
-        # Check if assistant has empty content and no tool_calls
-        last = cleaned[-1]
-        if last["role"] == "assistant" and not last.get("content") and not last.get("tool_calls"):
-            cleaned.pop()
-            removed += 1
-        # Check for orphaned tool results (tool without preceding assistant tool_calls)
-        elif last["role"] == "tool":
-            # Look back for matching assistant with tool_calls
-            has_match = False
-            for prev in reversed(cleaned[:-1]):
-                if prev["role"] == "assistant" and prev.get("tool_calls"):
-                    has_match = True
-                    break
-                if prev["role"] == "user":
-                    break
-            if not has_match:
-                cleaned.pop()
-                removed += 1
-            else:
-                break
+    # Pass 2: enforce tool-call pairing in both directions.
+    paired = []
+    repairs = 0  # in-place fixes (stripped tool_calls) — not captured by len delta
+    i = 0
+    n = len(normalized)
+    while i < n:
+        m = normalized[i]
+        role = m.get("role")
+        if role == "assistant" and m.get("tool_calls"):
+            ids = [tc.get("id") for tc in m["tool_calls"]]
+            # gather the contiguous 'tool' results immediately following
+            j = i + 1
+            answered = {}
+            while j < n and normalized[j].get("role") == "tool":
+                answered[normalized[j].get("tool_call_id")] = normalized[j]
+                j += 1
+            if all(tid in answered for tid in ids):
+                paired.append(m)
+                for tid in ids:  # canonical order; any extra/dup tools dropped
+                    paired.append(answered[tid])
+            elif m.get("content"):
+                # incomplete tool_calls: keep the text, drop the call + partials
+                m2 = dict(m)
+                m2.pop("tool_calls", None)
+                paired.append(m2)
+                repairs += 1
+            # else: drop the dangling assistant entirely
+            i = j
+        elif role == "tool":
+            i += 1  # orphan tool result — no assistant block consumed it
         else:
-            break
+            paired.append(m)
+            i += 1
 
-    if removed:
-        print(f"{DIM}(cleaned {removed} corrupted messages from history){RESET}")
+    # Pass 3: drop a trailing assistant with empty content and no tool_calls.
+    while len(paired) > 1 and paired[-1].get("role") == "assistant" \
+            and not paired[-1].get("content") and not paired[-1].get("tool_calls"):
+        paired.pop()
+
+    fixed = (original_len - len(paired)) + repairs
+    if fixed:
+        print(f"{DIM}(cleaned {fixed} corrupted messages from history){RESET}")
     else:
         print(f"{DIM}(history inspected — no corruption found){RESET}")
 
-    return cleaned
+    return paired
 
 
 def _tool_summary(name, args):
@@ -898,53 +910,15 @@ def main():
         ctx_display = f"{ctx_tokens}/{num_ctx} tokens (estimated)"
     else:
         ctx_display = f"{ctx_tokens} tokens (estimated)"
-    # Splash screen — spitting llama animation
+    # Splash screen — spitting llama animation. One static llama body; the
+    # spit glob is animated on top of it (see SPIT_SEQUENCE below).
     LLAMA_FRAMES = [
-        # Frame 1: mouth open
         [
             "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣴⣫⡏⡆⠀",
             "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡠⠊⠣⢉⠙⠤⡀",
             "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢰⠁⠀⠀⠈⠀⠀⣺",
             "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⠀⠀⠀⠁⢲⠉⠁",
             "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⡆⠀⠀⠀⠈⡇⠀",
-            "⠀⠀⠀⣠⠤⠤⠤⠄⠒⠒⠒⠒⠒⠦⠤⠤⠔⠒⠒⠇⠀⠀⠀⠀⢸⠀",
-            "⢀⣠⠞⠀⢀⢀⠄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡀⠀⠀⢸⠀",
-            "⢲⡿⠀⠀⠀⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢢⠀⡞⠀",
-            "⠙⠒⣇⡄⢀⡇⠀⠀⠀⠀⠀⠈⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡹⠀⠀",
-            "⠀⠀⠀⠉⠉⡷⡀⠀⠀⠀⠀⢠⠇⠀⠀⠀⠀⠀⠀⢀⠀⠀⡰⠃⠀⠀",
-            "⠀⠀⠀⠀⠀⢸⠘⡄⠀⠀⢠⠿⢤⠀⠀⠀⠀⢀⡠⠃⣀⡴⠋⠀⠀⠀",
-            "⠀⠀⠀⠀⠀⣎⡀⢹⠢⣀⡌⠀⠈⠙⠒⠲⠚⢹⠀⣠⠏⠀⠀⠀⠀⠀",
-            "⠀⠀⠀⠀⠀⡇⠰⠏⠀⡘⠀⠀⠀⠀⠀⠀⠀⢸⢦⠃⠀⠀⠀⠀⠀⠀",
-            "⠀⠀⠀⠀⠀⢱⠀⣧⠀⢇⠀⠀⠀⠀⠀⠀⠀⡜⠹⠀⠀⠀⠀⠀⠀⠀",
-            "⠀⠀⠀⠀⠀⠈⢆⡹⣇⠘⡄⠀⠀⠀⠀⠀⢀⡇⡜⢦⠀⠀⠀⠀⠀⠀",
-            "⠀⠀⠀⠀⠀⠀⠀⠙⠛⠲⢎⣢⠀⠀⠀⠀⠳⢎⣫⠁⠀⠀⠀⠀⠀⠀",
-        ],
-        # Frame 2: spit in flight
-        [
-            "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣴⣫⡏⡆⠀",
-            "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡠⠊⠣⢉⠙⠤⡀",
-            "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢰⠁⠀⠀⠈⠀⠀⣺",
-            "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⠀⠀⠀⠁⢲⠉⠁⠀⠀•",
-            "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⡆⠀⠀⠀⠈⡇⠀",
-            "⠀⠀⠀⣠⠤⠤⠤⠄⠒⠒⠒⠒⠒⠦⠤⠤⠔⠒⠒⠇⠀⠀⠀⠀⢸⠀",
-            "⢀⣠⠞⠀⢀⢀⠄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡀⠀⠀⢸⠀",
-            "⢲⡿⠀⠀⠀⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢢⠀⡞⠀",
-            "⠙⠒⣇⡄⢀⡇⠀⠀⠀⠀⠀⠈⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡹⠀⠀",
-            "⠀⠀⠀⠉⠉⡷⡀⠀⠀⠀⠀⢠⠇⠀⠀⠀⠀⠀⠀⢀⠀⠀⡰⠃⠀⠀",
-            "⠀⠀⠀⠀⠀⢸⠘⡄⠀⠀⢠⠿⢤⠀⠀⠀⠀⢀⡠⠃⣀⡴⠋⠀⠀⠀",
-            "⠀⠀⠀⠀⠀⣎⡀⢹⠢⣀⡌⠀⠈⠙⠒⠲⠚⢹⠀⣠⠏⠀⠀⠀⠀⠀",
-            "⠀⠀⠀⠀⠀⡇⠰⠏⠀⡘⠀⠀⠀⠀⠀⠀⠀⢸⢦⠃⠀⠀⠀⠀⠀⠀",
-            "⠀⠀⠀⠀⠀⢱⠀⣧⠀⢇⠀⠀⠀⠀⠀⠀⠀⡜⠹⠀⠀⠀⠀⠀⠀⠀",
-            "⠀⠀⠀⠀⠀⠈⢆⡹⣇⠘⡄⠀⠀⠀⠀⠀⢀⡇⡜⢦⠀⠀⠀⠀⠀⠀",
-            "⠀⠀⠀⠀⠀⠀⠀⠙⠛⠲⢎⣢⠀⠀⠀⠀⠳⢎⣫⠁⠀⠀⠀⠀⠀⠀",
-        ],
-        # Frame 3: spit lands
-        [
-            "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣴⣫⡏⡆⠀",
-            "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡠⠊⠣⢉⠙⠤⡀",
-            "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢰⠁⠀⠀⠈⠀⠀⣺",
-            "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⠀⠀⠀⠁⢲⠉⠁",
-            "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⡆⠀⠀⠀⠈⡇⠀⠀⠀⠀⠀⠀⠀•",
             "⠀⠀⠀⣠⠤⠤⠤⠄⠒⠒⠒⠒⠒⠦⠤⠤⠔⠒⠒⠇⠀⠀⠀⠀⢸⠀",
             "⢀⣠⠞⠀⢀⢀⠄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡀⠀⠀⢸⠀",
             "⢲⡿⠀⠀⠀⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢢⠀⡞⠀",
@@ -958,15 +932,37 @@ def main():
             "⠀⠀⠀⠀⠀⠀⠀⠙⠛⠲⢎⣢⠀⠀⠀⠀⠳⢎⣫⠁⠀⠀⠀⠀⠀⠀",
         ],
     ]
+    # The static llama body; the spit glob is overlaid/animated on top of it.
+    BASE_LLAMA = LLAMA_FRAMES[0]
+    SPIT_ROW = 3  # line at the llama's mouth height where the glob launches
+
+    # Each step: (text drawn to the right of SPIT_ROW, shake = leading-space
+    # jitter applied to the whole llama). The glob swells ·→•→●→◉ as it flies,
+    # trails behind itself, then freezes mid-air on the final frame (which stays
+    # on screen, since the title prints below without erasing it).
+    SPIT_SEQUENCE = [
+        (" ·",            0),
+        ("  ·",           0),
+        ("   ·•",         0),
+        ("    ·•",        0),
+        ("     ·•●",      0),
+        ("      ·•●",     0),
+        ("       ·•◉",    0),
+        ("        ·•◉",   0),
+        ("         ·•◉",  0),
+        ("          ·•◉", 0),  # spit frozen in mid-air — final frame stays on screen
+    ]
     if not args.pipe:
-        num_lines = len(LLAMA_FRAMES[0])
-        for frame in LLAMA_FRAMES:
-            for line in frame:
-                print(line)
+        num_lines = len(BASE_LLAMA)
+        for step, (spit, shake) in enumerate(SPIT_SEQUENCE):
+            if step:
+                sys.stdout.write(f"\033[{num_lines}A")  # rewind to redraw in place
+            pad = " " * shake
+            for i, line in enumerate(BASE_LLAMA):
+                row = pad + line + (spit if i == SPIT_ROW else "")
+                sys.stdout.write("\r" + row + "\033[K\n")  # \033[K wipes stale tail
             sys.stdout.flush()
-            time.sleep(0.4)
-            if frame is not LLAMA_FRAMES[-1]:
-                sys.stdout.write(f"\033[{num_lines}A")
+            time.sleep(0.11)
 
         print(f"{BOLD}{CYAN}MatthewCode{RESET} {DIM}({client}){RESET}")
         print(f"{DIM}Type /help for commands | {ctx_display}{RESET}")
@@ -1270,11 +1266,20 @@ def main():
                     recent_msgs.insert(0, msg)
                     if len(recent_msgs) >= num_kept:
                         break
+                # The count-based slice can start mid tool-call exchange. A leading
+                # 'tool' result whose parent assistant+tool_calls was sliced off is
+                # an orphan that litellm/OpenAI reject. Drop leading orphans so the
+                # window starts on a clean boundary (a user or assistant message).
+                while recent_msgs and recent_msgs[0].get("role") == "tool":
+                    recent_msgs.pop(0)
                 messages = [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "system", "content": f"Previous conversation summary:\n{summary_text}"},
                     {"role": "system", "content": f"The following {len(recent_msgs)} message(s) are the most recent user requests from before the conversation was compressed:"},
                 ] + recent_msgs
+                # Sanitize the rebuilt list before persisting — rebirth previously
+                # saved directly, so malformed tool sequences were never checked.
+                messages = sanitize_messages(messages)
                 ctx_tokens = 0
                 save_history(messages, session_file)
                 print(f"{DIM}Rebirth complete: {old_count} messages → {len(messages)}, "
