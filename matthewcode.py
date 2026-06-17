@@ -32,6 +32,8 @@ from rich.theme import Theme
 from prompt_toolkit import prompt as pt_prompt
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.formatted_text import ANSI
+from prompt_toolkit.shortcuts import CompleteStyle
+from res.tabcompletion import build_slash_completer
 
 console = Console(theme=Theme({
     "info": "dim",
@@ -74,6 +76,49 @@ def _encode_path(path):
 
 def session_path(name="last_session"):
     return os.path.join(HISTORY_DIR, f"{_encode_path(SESSION_DIR_KEY)}!{name}.json")
+
+
+def _list_session_names():
+    """Names of saved sessions for the current directory.
+
+    Single source for both the `/session` listing and TAB completion.
+    """
+    os.makedirs(HISTORY_DIR, exist_ok=True)
+    prefix = f"{_encode_path(SESSION_DIR_KEY)}!"
+    return sorted(f[len(prefix):-5] for f in os.listdir(HISTORY_DIR)
+                  if f.startswith(prefix) and f.endswith(".json"))
+
+
+# Single source of truth for slash commands: drives the `/help` listing AND TAB
+# completion. Add a command here once; both update. (label, help) — `label` is
+# the display form including any `<arg>` and comma-listed aliases.
+SLASH_COMMANDS = [
+    ("/help", "Show this help"),
+    ("/exit, /quit", "Exit MatthewCode"),
+    ("/clear", "Reset conversation"),
+    ("/history", "View raw session JSON in less (from the bottom)"),
+    ("/rebirth", "Compress context via LLM summary"),
+    ("/name <name>", "Save/name this session"),
+    ("/session", "List saved sessions"),
+    ("/session <name>", "Switch to a session (creates if new)"),
+    ("/provider", "List available LLM providers"),
+    ("/provider <name>", "Switch to a different provider"),
+    ("/verbose", "Toggle verbose mode"),
+    ("/kill-model", "Terminate the active AI (local ollama serve OR Slurm job)"),
+    ("/diagnose", "Probe the active AI: tunnel, /api/tags, /api/ps, Slurm job"),
+]
+
+# Hidden aliases the dispatch accepts but `/help` doesn't advertise as own rows.
+_SLASH_ALIASES = ["/rename", "/sessions"]
+
+
+def _slash_command_tokens():
+    """Bare command tokens (deduped) derived from SLASH_COMMANDS, for completion."""
+    tokens = list(_SLASH_ALIASES)
+    for label, _ in SLASH_COMMANDS:
+        for piece in label.split(","):              # split "/exit, /quit" aliases
+            tokens.append(piece.strip().split(" ", 1)[0])  # drop any "<arg>"
+    return sorted(set(tokens))
 
 def load_config() -> dict:
     """Load app config from config.yaml and LLM providers from global config."""
@@ -1082,6 +1127,14 @@ def main():
         sys.exit(0)
 
     pt_history = FileHistory(os.path.join(HISTORY_DIR, "prompt_history"))
+    slash_completer = build_slash_completer(
+        _slash_command_tokens(),
+        arg_value_funcs={
+            "/provider": LLMConnection.list_providers,
+            "/session": _list_session_names,
+            "/sessions": _list_session_names,
+        },
+    )
 
     while True:
         try:
@@ -1127,6 +1180,9 @@ def main():
             user_input = pt_prompt(
                 ANSI("◗ "),
                 history=pt_history,
+                completer=slash_completer,
+                complete_while_typing=False,                # TAB-triggered, no live menu
+                complete_style=CompleteStyle.READLINE_LIKE,  # bash-style completion
             ).strip()
         except (EOFError, KeyboardInterrupt):
             print(f"\n{DIM}Bye!{RESET}")
@@ -1138,19 +1194,8 @@ def main():
         # Slash commands
         if user_input == "/help":
             print(f"{DIM}Commands:{RESET}")
-            print(f"  /help                 Show this help")
-            print(f"  /exit, /quit          Exit MatthewCode")
-            print(f"  /clear                Reset conversation")
-            print(f"  /history              View raw session JSON in less (from the bottom)")
-            print(f"  /rebirth              Compress context via LLM summary")
-            print(f"  /name <name>          Save/name this session")
-            print(f"  /session              List saved sessions")
-            print(f"  /session <name>       Switch to a session (creates if new)")
-            print(f"  /provider             List available LLM providers")
-            print(f"  /provider <name>      Switch to a different provider")
-            print(f"  /verbose              Toggle verbose mode")
-            print(f"  /kill-model           Terminate the active AI (local ollama serve OR Slurm job)")
-            print(f"  /diagnose             Probe the active AI: tunnel, /api/tags, /api/ps, Slurm job")
+            for label, helptext in SLASH_COMMANDS:
+                print(f"  {label:<22}{helptext}")
             continue
         elif user_input == "/verbose":
             args.verbose = not args.verbose
@@ -1351,10 +1396,7 @@ def main():
                 print(f"{DIM}Session unnamed. Usage: /name <session_name>{RESET}")
             continue
         elif user_input == "/sessions" or user_input == "/session":
-            os.makedirs(HISTORY_DIR, exist_ok=True)
-            prefix = f"{_encode_path(SESSION_DIR_KEY)}!"
-            sessions = sorted(f[len(prefix):-5] for f in os.listdir(HISTORY_DIR)
-                              if f.startswith(prefix) and f.endswith(".json"))
+            sessions = _list_session_names()
             if sessions:
                 print(f"{DIM}Saved sessions:{RESET}")
                 for s in sessions:
