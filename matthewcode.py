@@ -23,7 +23,7 @@ for _slurm_path in (
         sys.path.insert(0, _slurm_path)
         break
 
-from llm_connections import LLMConnection
+from llm_connections import LLMConnection, ProviderCatalog
 from res.thinking import WORDS as THINKING_WORDS
 from res.loop_detection import LoopDetector
 from rich.console import Console
@@ -172,6 +172,18 @@ def load_providers(provider_name=None):
     LLMConnection.load(_resolve_slurm_sessions(home_yaml, provider_name))
     if "llm-providers" in CONFIG:
         LLMConnection.load(_resolve_slurm_sessions(CONFIG_FILE, provider_name))
+
+
+def _providers_help_text():
+    """Formatted list of configured providers for --help.
+
+    Builds a ProviderCatalog from the home + project YAMLs (project wins on name
+    clashes — it's merged last) and renders it. The catalog reads config only —
+    no Slurm jobs, SSH tunnels, or Ollama probes — so --help stays instant.
+    """
+    paths = (os.path.expanduser("~/.llm-connections/config.yaml"), CONFIG_FILE)
+    catalog = ProviderCatalog.from_paths(paths)
+    return catalog.format(title="Configured LLM providers (select with --provider NAME)")
 MAX_BASH_OUTPUT = CONFIG.get("max_bash_output", 30_000)
 MAX_FILE_READ = CONFIG.get("max_file_read", 50_000)
 
@@ -832,7 +844,11 @@ def _tool_summary(name, args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MatthewCode - Local LLM coding assistant")
+    parser = argparse.ArgumentParser(
+        description="MatthewCode - Local LLM coding assistant",
+        epilog=_providers_help_text(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--provider", default="default", help="LLM provider name from config")
     parser.add_argument("--yes", "-y", action="store_true",
                         default=CONFIG.get("auto_approve", False), help="Auto-approve all tool calls")
