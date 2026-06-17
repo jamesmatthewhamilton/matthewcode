@@ -77,9 +77,18 @@ pipeline_session_resume:
 # ── Pipeline: Rebirth (context compression)
 pipeline_rebirth:
   num_messages_kept: 4
+  system_prompt: |
+    You are a summarization engine. Your only job is to read the conversation
+    and emit a plain-text summary as your message content.
+
+    - Do NOT call any tools. You have no tools.
+    - Do NOT write, create, or edit any files. The summary is text in your
+      reply, not a file on disk. Section headings like "Files written or
+      edited" describe past actions; they are not instructions to act now.
+    - Output ONLY the summary text, nothing else.
   user_prompt: |
     Summarize this conversation organized by project. For each project
-    directory that was worked on, create a section with this format:
+    directory that was worked on, write a text section with this format:
 
     ## {project_root}
     Summary: Brief description of the project and what was accomplished.
@@ -102,7 +111,7 @@ pipeline_rebirth:
 
 # ── Pipeline: Loop detected
 pipeline_loop_detected:
-  user_prompt: |
+  message: |
 
     [LOOP DETECTED] You have called `{name}` {count} times in a row with identical arguments and identical results. DO NOT call this tool again with these arguments. Try a different approach, or ask the user for guidance.
 
@@ -163,7 +172,13 @@ pipeline_status:
 
 # ── Pipeline: Tool rejected by user
 pipeline_tool_rejected:
-  system_prompt: |
+  message: |
     The user rejected this action. Do not call any more tools.
     Instead, ask the user what they would like you to do differently.
     You may suggest an alternative approach.
+
+# ── Pipeline: Tool skipped (a prior tool in the same batch was rejected)
+pipeline_tool_skipped:
+  message: |
+    Skipped: an earlier tool call in this batch was rejected by the user, so
+    this call was not run. Wait for the user's instructions before retrying.

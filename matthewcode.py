@@ -732,7 +732,7 @@ def load_history(session_file):
     return []
 
 
-def sanitize_messages(messages: list) -> list:
+def sanitize_messages(messages: list, quiet: bool = False) -> list:
     """Fix corrupted history so it satisfies strict OpenAI/litellm tool-call
     pairing (Ollama is lenient about this; litellm is not).
 
@@ -809,7 +809,7 @@ def sanitize_messages(messages: list) -> list:
     fixed = (original_len - len(paired)) + repairs
     if fixed:
         print(f"{DIM}(cleaned {fixed} corrupted messages from history){RESET}")
-    else:
+    elif not quiet:
         print(f"{DIM}(history inspected — no corruption found){RESET}")
 
     return paired
@@ -984,6 +984,10 @@ def main():
         detector = make_loop_detector()
         for _iter in range(max_iters):
             try:
+                # safety net: repair any malformed tool-call pairing before it
+                # reaches a strict provider. quiet so clean iterations stay
+                # silent; real cleanups still print
+                messages = sanitize_messages(messages, quiet=True)
                 response = client.chat(messages, tools=TOOLS, stream=True)
                 full_content = ""
                 tool_calls = []
@@ -997,18 +1001,28 @@ def main():
                 if not tool_calls:
                     tool_calls = response.tool_calls
 
-                # Fallback text parsing
+                # fallback text parsing; synthesize a proper assistant tool_calls
+                # block + matching tool_call_id results so the payload stays valid
+                # on strict providers and survives sanitize/reload
                 if not tool_calls and full_content:
                     fallback = parse_tool_calls_from_text(full_content)
                     if fallback:
-                        messages.append({"role": "assistant", "content": full_content})
-                        for name, tc_args in fallback:
+                        assistant_msg = {"role": "assistant", "content": full_content}
+                        assistant_msg["tool_calls"] = [
+                            {"id": f"call_{i}", "type": "function",
+                             "function": {"name": name,
+                                          "arguments": tc_args if isinstance(tc_args, dict) else json.loads(tc_args)}}
+                            for i, (name, tc_args) in enumerate(fallback)
+                        ]
+                        messages.append(assistant_msg)
+                        for i, (name, tc_args) in enumerate(fallback):
+                            call_id = f"call_{i}"
                             print(f"[{name}: {_tool_summary(name, tc_args)}]", file=sys.stderr)
                             result = TOOL_DISPATCH[name](tc_args)
                             if detector.record(name, tc_args, result):
-                                result += get_prompt("pipeline_loop_detected", "user_prompt", name=name, count=detector.threshold)
+                                result += get_prompt("pipeline_loop_detected", "message", name=name, count=detector.threshold)
                                 detector.reset()
-                            messages.append({"role": "tool", "content": result})
+                            messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
                         continue
 
                 if not tool_calls:
@@ -1038,7 +1052,7 @@ def main():
                     else:
                         result = get_prompt("pipeline_tool_errors", "unknown_tool", name=name)
                     if detector.record(name, tc_args, result):
-                        result += get_prompt("pipeline_loop_detected", "user_prompt", name=name, count=detector.threshold)
+                        result += get_prompt("pipeline_loop_detected", "message", name=name, count=detector.threshold)
                         detector.reset()
                     messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
 
@@ -1241,7 +1255,13 @@ def main():
                 old_count = len(messages) - 1
                 old_tokens = ctx_tokens
 
-                response = client.chat(messages, tools=TOOLS, stream=True)
+                # summarize with a dedicated system prompt and no tools so the
+                # summary comes back as text, not file_write calls
+                rebirth_system = get_prompt("pipeline_rebirth", "system_prompt")
+                summarize_messages = [
+                    {"role": "system", "content": rebirth_system}
+                ] + messages[1:]
+                response = client.chat(summarize_messages, tools=None, stream=True)
                 summary_text = ""
                 for chunk in response:
                     if chunk.text:
@@ -1371,6 +1391,10 @@ def main():
         detector = make_loop_detector()
         for _iter in range(max_iters):
             try:
+                # safety net: repair any malformed tool-call pairing before it
+                # reaches a strict provider. quiet so clean iterations stay
+                # silent; real cleanups still print
+                messages = sanitize_messages(messages, quiet=True)
                 # Use llm_connections for the chat call
                 response = client.chat(messages, tools=TOOLS, stream=True)
 
@@ -1418,9 +1442,19 @@ def main():
                     fallback = parse_tool_calls_from_text(full_content)
                     if fallback:
                         print(f"{DIM}(parsed tool call from text){RESET}")
-                        messages.append({"role": "assistant", "content": full_content})
+                        # synthesize a proper assistant tool_calls block so every
+                        # call has an id that a tool result can answer
+                        assistant_msg = {"role": "assistant", "content": full_content}
+                        assistant_msg["tool_calls"] = [
+                            {"id": f"call_{i}", "type": "function",
+                             "function": {"name": name,
+                                          "arguments": tc_args if isinstance(tc_args, dict) else json.loads(tc_args)}}
+                            for i, (name, tc_args) in enumerate(fallback)
+                        ]
+                        messages.append(assistant_msg)
                         rejected = False
-                        for name, tc_args in fallback:
+                        for i, (name, tc_args) in enumerate(fallback):
+                            call_id = f"call_{i}"
                             print(f"{DIM}[{name}: {_tool_summary(name, tc_args)}]{RESET}")
                             protected = CONFIG.get("rules", {}).get("protected_paths", [])
                             tool_path = tc_args.get("path", "")
@@ -1428,14 +1462,18 @@ def main():
                             restricted = is_restricted_bash(name, tc_args)
                             if restricted or (not is_safe and not args.yes):
                                 if not confirm_tool(name, tc_args, restricted=restricted):
-                                    messages.append({"role": "assistant", "content": get_prompt("pipeline_tool_rejected", "system_prompt")})
+                                    messages.append({"role": "tool", "tool_call_id": call_id, "content": get_prompt("pipeline_tool_rejected", "message")})
+                                    # answer the remaining declared call ids so the
+                                    # assistant tool_calls block stays fully paired
+                                    for j in range(i + 1, len(fallback)):
+                                        messages.append({"role": "tool", "tool_call_id": f"call_{j}", "content": get_prompt("pipeline_tool_skipped", "message")})
                                     rejected = True
                                     break
                             result = TOOL_DISPATCH[name](tc_args)
                             if detector.record(name, tc_args, result):
-                                result += get_prompt("pipeline_loop_detected", "user_prompt", name=name, count=detector.threshold)
+                                result += get_prompt("pipeline_loop_detected", "message", name=name, count=detector.threshold)
                                 detector.reset()
-                            messages.append({"role": "tool", "content": result})
+                            messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
                         if rejected:
                             break
                         continue
@@ -1482,7 +1520,11 @@ def main():
                     restricted = is_restricted_bash(name, tc_args)
                     if restricted or (not is_safe and not args.yes):
                         if not confirm_tool(name, tc_args, restricted=restricted):
-                            messages.append({"role": "tool", "tool_call_id": call_id, "content": get_prompt("pipeline_tool_rejected", "system_prompt")})
+                            messages.append({"role": "tool", "tool_call_id": call_id, "content": get_prompt("pipeline_tool_rejected", "message")})
+                            # answer the remaining declared call ids so the
+                            # assistant tool_calls block stays fully paired
+                            for j in range(i + 1, len(tool_calls)):
+                                messages.append({"role": "tool", "tool_call_id": f"call_{j}", "content": get_prompt("pipeline_tool_skipped", "message")})
                             break
 
                     if name in TOOL_DISPATCH:
@@ -1496,7 +1538,7 @@ def main():
                         result = get_prompt("pipeline_tool_errors", "unknown_tool", name=name)
                     if detector.record(name, tc_args, result):
                         print(f"{YELLOW}  ⚠ loop detected — nudging model{RESET}")
-                        result += get_prompt("pipeline_loop_detected", "user_prompt", name=name, count=detector.threshold)
+                        result += get_prompt("pipeline_loop_detected", "message", name=name, count=detector.threshold)
                         detector.reset()
                     messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
 
