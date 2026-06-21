@@ -89,37 +89,6 @@ def _list_session_names():
                   if f.startswith(prefix) and f.endswith(".json"))
 
 
-# Single source of truth for slash commands: drives the `/help` listing AND TAB
-# completion. Add a command here once; both update. (label, help) — `label` is
-# the display form including any `<arg>` and comma-listed aliases.
-SLASH_COMMANDS = [
-    ("/help", "Show this help"),
-    ("/exit, /quit", "Exit MatthewCode"),
-    ("/clear", "Reset conversation"),
-    ("/history", "View raw session JSON in less (from the bottom)"),
-    ("/rebirth", "Compress context via LLM summary"),
-    ("/name <name>", "Save/name this session"),
-    ("/session", "List saved sessions"),
-    ("/session <name>", "Switch to a session (creates if new)"),
-    ("/provider", "List available LLM providers"),
-    ("/provider <name>", "Switch to a different provider"),
-    ("/verbose", "Toggle verbose mode"),
-    ("/kill-model", "Terminate the active AI (local ollama serve OR Slurm job)"),
-    ("/diagnose", "Probe the active AI: tunnel, /api/tags, /api/ps, Slurm job"),
-]
-
-# Hidden aliases the dispatch accepts but `/help` doesn't advertise as own rows.
-_SLASH_ALIASES = ["/rename", "/sessions"]
-
-
-def _slash_command_tokens():
-    """Bare command tokens (deduped) derived from SLASH_COMMANDS, for completion."""
-    tokens = list(_SLASH_ALIASES)
-    for label, _ in SLASH_COMMANDS:
-        for piece in label.split(","):              # split "/exit, /quit" aliases
-            tokens.append(piece.strip().split(" ", 1)[0])  # drop any "<arg>"
-    return sorted(set(tokens))
-
 def load_config() -> dict:
     """Load app config from config.yaml and LLM providers from global config."""
     import yaml
@@ -228,7 +197,7 @@ def _providers_help_text():
     """
     paths = (os.path.expanduser("~/.llm-connections/config.yaml"), CONFIG_FILE)
     catalog = ProviderCatalog.from_paths(paths)
-    return catalog.format(title="Configured LLM providers (select with --provider NAME)")
+    return catalog.format(title="providers")
 MAX_BASH_OUTPUT = CONFIG.get("max_bash_output", 30_000)
 MAX_FILE_READ = CONFIG.get("max_file_read", 50_000)
 
@@ -885,27 +854,698 @@ def _tool_summary(name, args):
     return str(args)
 
 
+# --- Command registry ---------------------------------------------------------
+# One entry per command is the single source of truth: it drives slash dispatch,
+# /help, TAB completion, AND one-shot `--flag` invocation. A `--flag` runs the
+# same handler as its `/command` with an empty arg, once, then exits.
+
+from dataclasses import dataclass, field
+from typing import Callable, Optional
+
+
+class ReplContext:
+    """Mutable REPL state a command handler reads/writes.
+
+    The same handler runs inside the interactive loop (state copied back into the
+    loop locals afterwards) or from a one-shot flag (state discarded on exit).
+    """
+
+    def __init__(self, *, args, console, client, messages,
+                 session_name, session_file, ctx_tokens):
+        self.args = args
+        self.console = console
+        self.client = client
+        self.messages = messages
+        self.session_name = session_name
+        self.session_file = session_file
+        self.ctx_tokens = ctx_tokens
+        self.should_exit = False
+
+
+@dataclass(frozen=True)
+class Command:
+    """One user-facing thing, declared ONCE. `flag_command` holds the bare token
+    name(s) — NO `/` or `--`. The surface prefix is added at use-time: `/<token>`
+    for the command form, `--<token>` for the flag form. The two booleans decide
+    which surfaces this appears on (in help) and is usable from. Both default to
+    True — a thing is a command AND a flag unless an entry opts out below."""
+    help: str                              # the single description for both surfaces
+    flag_command: tuple = ()               # bare token name(s), e.g. ("exit","quit"); no / or --
+    run: Optional[Callable] = None         # handler for the command / one-shot flag
+    arghint: str = ""                      # "[<name>]" — /help display
+    arg_values: Optional[Callable] = None  # tab-completion source for the arg
+    flag_kwargs: dict = field(default_factory=dict)  # extra argparse kwargs for the flag
+    is_command: bool = True                # shows in /help as /<token> and usable as a command
+    is_flag: bool = True                   # shows in --help as --<token> and usable as a flag
+    needs_client: bool = False             # one-shot flag runs AFTER provider/client setup
+    one_shot: bool = False                 # flag runs run(ctx,"") once, then exits
+
+    def __post_init__(self):
+        # Footgun guard: `("session")` is a *string*, not a tuple (missing comma) —
+        # iterating it would yield characters ('s','e',...). Coerce a bare string
+        # to a 1-tuple so a missing comma can't silently register --s, --e, ...
+        if isinstance(self.flag_command, str):
+            object.__setattr__(self, "flag_command", (self.flag_command,))
+
+
+def cmd_help(ctx, arg):
+    print(f"{DIM}Commands:{RESET}")
+    rows = []
+    for c in COMMANDS:
+        if not c.is_command:            # flag-only (e.g. --prompt) — see --help
+            continue
+        label = ", ".join(f"/{t}" for t in c.flag_command)   # add / per surface
+        if c.arghint:
+            label += f" {c.arghint}"
+        rows.append((label, c.help))
+    width = max(len(label) for label, _ in rows)
+    for label, helptext in rows:
+        print(f"  {label:<{width}}  {helptext}")
+
+
+def cmd_verbose(ctx, arg):
+    ctx.args.verbose = not ctx.args.verbose
+    print(f"{DIM}Verbose: {'on' if ctx.args.verbose else 'off'}{RESET}")
+
+
+def cmd_yes(ctx, arg):
+    ctx.args.yes = not ctx.args.yes
+    print(f"{DIM}Auto-approve: {'on' if ctx.args.yes else 'off'}{RESET}")
+
+
+def cmd_exit(ctx, arg):
+    print(f"{DIM}Bye!{RESET}")
+    ctx.should_exit = True
+
+
+def cmd_clear(ctx, arg):
+    # Empty the CURRENT session in place (keep its name/file) and persist — so
+    # `--session X --clear` actually wipes X, and /clear wipes the open session.
+    ctx.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    ctx.ctx_tokens = 0
+    save_history(ctx.messages, ctx.session_file)
+    print(f"{DIM}Conversation cleared.{RESET}")
+
+
+def cmd_history(ctx, arg):
+    """Render the session as a chronological transcript — one rich Panel per turn,
+    colour-coded by role, with prose as Markdown, tool results as pretty JSON, and
+    tool calls as concise `→ name summary` lines (no raw JSON blobs)."""
+    from rich.console import Group
+    from rich.json import JSON
+    from rich.panel import Panel
+
+    if not ctx.messages:
+        print(f"{DIM}No history.{RESET}")
+        return
+
+    ROLE_STYLE = {"user": "cyan", "assistant": "green", "system": "dim", "tool": "yellow"}
+
+    def _panel(i, msg):
+        role = msg.get("role", "?")
+        parts = []
+        content = msg.get("content")
+        if content:
+            if role in ("user", "assistant", "system"):
+                parts.append(Markdown(content if isinstance(content, str) else str(content)))
+            else:                                   # tool result: pretty JSON, else plain text
+                try:
+                    parts.append(JSON(content))
+                except (ValueError, TypeError):
+                    parts.append(str(content))
+        for tc in msg.get("tool_calls") or []:      # de-mangle tool calls → one tidy line
+            fn = tc.get("function", tc)
+            name = fn.get("name", "?")
+            args = fn.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            parts.append(f"[bold]→ {name}[/]  [dim]{_tool_summary(name, args)}[/]")
+        body = Group(*parts) if parts else "[dim](no content)[/dim]"
+        return Panel(body, title=f"#{i} · {role}", title_align="left",
+                     border_style=ROLE_STYLE.get(role, "white"), padding=(0, 1))
+
+    # Print straight to the terminal — rich emits colour, the terminal interprets it,
+    # and rich auto-strips colour when piped to a file. (Paging via `less` was the
+    # bug: it showed the colour codes as literal `ESC[..m` text unless run with -R.
+    # Want paging? `matthewcode --history | less -R`.)
+    for i, msg in enumerate(ctx.messages):
+        ctx.console.print(_panel(i, msg))
+
+
+def cmd_diagnose(ctx, arg):
+    import time as _time
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+
+    cur = LLMConnection._registry.get(ctx.args.provider)
+    base_url = getattr(getattr(cur, "_provider", None), "base_url", None)
+    print(f"{DIM}── /diagnose {ctx.args.provider} ──{RESET}")
+    print(f"  base_url: {base_url or '(none)'}")
+
+    def _probe(path, timeout=5.0):
+        if not base_url:
+            return ("?", 0.0, "no base_url")
+        url = base_url.rstrip("/") + path
+        t0 = _time.time()
+        try:
+            with _urlreq.urlopen(url, timeout=timeout) as r:
+                body = r.read().decode("utf-8", errors="replace")
+                return (r.status, _time.time() - t0, body[:500])
+        except _urlerr.HTTPError as e:
+            return (e.code, _time.time() - t0, str(e))
+        except Exception as e:
+            return ("ERR", _time.time() - t0, f"{type(e).__name__}: {e}")
+
+    for path in ("/api/tags", "/api/ps"):
+        code, dt, body = _probe(path)
+        color = GREEN if code == 200 else RED
+        print(f"  {color}{path:<10} {code} ({dt*1000:.0f}ms){RESET}")
+        if body and code != 200:
+            print(f"    {DIM}{body}{RESET}")
+        elif body and code == 200 and path == "/api/ps":
+            print(f"    {DIM}{body}{RESET}")
+
+    from llm_connections import SlurmSession
+    handle = SlurmSession.active_by_local_url(base_url) if base_url else None
+    if handle is not None:
+        print(f"  {DIM}Slurm: cluster={handle.cluster}, job={handle.job_id}, "
+              f"remote={handle.remote_host}:{handle.remote_port}, gpu={handle.gpu_info}{RESET}")
+        print(f"  {DIM}Check the job manually:{RESET}")
+        print(f"    ssh {handle.ssh_target} 'squeue -j {handle.job_id}; "
+              f"tail -50 ~/log/{handle.name}-{handle.job_id}.log'")
+    elif base_url and ("localhost" in base_url or "127.0.0.1" in base_url):
+        print(f"  {DIM}Local Ollama; if /api/tags hangs run 'pkill ollama' and restart.{RESET}")
+
+
+def cmd_kill_model(ctx, arg):
+    cur = LLMConnection._registry.get(ctx.args.provider)
+    base_url = getattr(getattr(cur, "_provider", None), "base_url", None)
+    killed_what = None
+
+    from llm_connections import SlurmSession
+    handle = SlurmSession.active_by_local_url(base_url) if base_url else None
+    if handle is not None:
+        handle.kill()
+        killed_what = f"Slurm job {handle.job_id} on cluster {handle.cluster}"
+    elif base_url and ("localhost" in base_url or "127.0.0.1" in base_url):
+        from llm_connections.llm_providers.ollama import kill_local_server
+        if kill_local_server():
+            killed_what = "local ollama serve"
+        else:
+            print(f"{YELLOW}No local 'ollama serve' process was running.{RESET}")
+    else:
+        print(
+            f"{YELLOW}Provider '{ctx.args.provider}' is at {base_url or '?'}; "
+            f"not managed by matthewcode (not local, no Slurm session).{RESET}"
+        )
+
+    if killed_what:
+        print(f"{GREEN}/kill-model: terminated {killed_what}.{RESET}")
+
+
+def cmd_name(ctx, arg):
+    if not arg:
+        if ctx.session_name:
+            print(f"{DIM}Current session: '{ctx.session_name}'{RESET}")
+        else:
+            print(f"{DIM}Session unnamed. Usage: /name <session_name>{RESET}")
+        return
+    new_name = arg.strip()
+    new_file = session_path(new_name)
+    if os.path.isfile(new_file) and new_name != ctx.session_name:
+        try:
+            answer = input(f"{YELLOW}Session '{new_name}' exists. Overwrite? [y/N] {RESET}").strip().lower()
+            if answer not in ("y", "yes"):
+                print(f"{DIM}Cancelled.{RESET}")
+                return
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+    ctx.session_name = new_name
+    ctx.session_file = new_file
+    save_history(ctx.messages, ctx.session_file)
+    print(f"{DIM}Session saved as '{ctx.session_name}'{RESET}")
+
+
+def cmd_session(ctx, arg):
+    if not arg:
+        sessions = _list_session_names()
+        if sessions:
+            print(f"{DIM}Saved sessions:{RESET}")
+            for s in sessions:
+                marker = f" {CYAN}<--- [Active]{RESET}" if s == (ctx.session_name or "last_session") else ""
+                msgs = load_history(session_path(s))
+                print(f"  {s} ({len(msgs)} messages){marker}")
+        else:
+            print(f"{DIM}No saved sessions.{RESET}")
+        return
+    new_session = arg.strip()
+    save_history(ctx.messages, ctx.session_file)            # save current before switching
+    ctx.session_name = new_session
+    ctx.session_file = session_path(new_session)
+    if os.path.isfile(ctx.session_file):
+        ctx.messages = sanitize_messages(load_history(ctx.session_file))
+        print(f"{DIM}Switched to '{ctx.session_name}' ({len(ctx.messages)} messages){RESET}")
+    else:
+        ctx.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        print(f"{DIM}Created new session '{ctx.session_name}'{RESET}")
+    ctx.ctx_tokens = 0
+
+
+def cmd_provider(ctx, arg):
+    if not arg:
+        # offline listing from config (no connection / Slurm spin-up)
+        paths = (os.path.expanduser("~/.llm-connections/config.yaml"), CONFIG_FILE)
+        catalog = ProviderCatalog.from_paths(paths)
+        print(f"{DIM}Providers:{RESET}")
+        for p in catalog:
+            marker = f" {CYAN}<--- [Active]{RESET}" if p.name == ctx.args.provider else ""
+            print(f"  {p.name} ({p.model}){marker}")
+        return
+    name = arg.strip()
+    try:
+        ctx.client = LLMConnection.get(name)
+        ctx.args.provider = name
+        print(f"{DIM}Switched to {ctx.client}{RESET}")
+    except KeyError as e:
+        print(f"{RED}{e}{RESET}")
+
+
+def cmd_rebirth(ctx, arg):
+    if len(ctx.messages) <= 2:
+        print(f"{DIM}Nothing to compress.{RESET}")
+        return
+    RED_LINE = "\033[31m"
+    RED_BG = "\033[41;30m"
+    try:
+        tw_r = os.get_terminal_size().columns
+    except OSError:
+        tw_r = 80
+    rebirth_text = " Now I must destroy myself to be born again anew... 🧎 "
+    visible_len = len(rebirth_text) + 1   # emoji takes 2 columns
+    dash_len = tw_r - visible_len
+    print(RED_BG + rebirth_text + RESET + RED_LINE + "—" * max(dash_len, 0) + RESET)
+    try:
+        rebirth_prompt = get_prompt("pipeline_rebirth", "user_prompt")
+        ctx.messages.append({"role": "user", "content": rebirth_prompt})
+        old_count = len(ctx.messages) - 1
+        old_tokens = ctx.ctx_tokens
+
+        # summarize with a dedicated system prompt and no tools so the summary
+        # comes back as text, not file_write calls
+        rebirth_system = get_prompt("pipeline_rebirth", "system_prompt")
+        summarize_messages = [
+            {"role": "system", "content": rebirth_system}
+        ] + ctx.messages[1:]
+        response = ctx.client.chat(summarize_messages, tools=None, stream=True)
+        summary_text = ""
+        for chunk in response:
+            if chunk.text:
+                summary_text += chunk.text
+        if not summary_text:
+            summary_text = response.text
+        summary_text = summary_text.strip()
+
+        if not summary_text:
+            ctx.messages.pop()  # remove rebirth prompt
+            print(f"{RED}Failed to generate summary.{RESET}")
+            return
+
+        num_kept = CONFIG.get("pipeline_rebirth", {}).get("num_messages_kept", 5)
+        recent_msgs = []
+        for msg in reversed(ctx.messages):
+            if msg.get("content", "").startswith("Summarize this"):
+                continue
+            recent_msgs.insert(0, msg)
+            if len(recent_msgs) >= num_kept:
+                break
+        # Drop leading orphan tool results so the window starts on a clean boundary.
+        while recent_msgs and recent_msgs[0].get("role") == "tool":
+            recent_msgs.pop(0)
+        ctx.messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": f"Previous conversation summary:\n{summary_text}"},
+            {"role": "system", "content": f"The following {len(recent_msgs)} message(s) are the most recent user requests from before the conversation was compressed:"},
+        ] + recent_msgs
+        ctx.messages = sanitize_messages(ctx.messages)
+        ctx.ctx_tokens = 0
+        save_history(ctx.messages, ctx.session_file)
+        print(f"{DIM}Rebirth complete: {old_count} messages → {len(ctx.messages)}, "
+              f"{old_tokens} tokens → {len(summary_text)} chars{RESET}")
+        render_markdown(summary_text)
+    except Exception as e:
+        print(f"{RED}Rebirth failed: {e}{RESET}")
+
+
+# THE single list. Each entry has bare `flag_command` token(s); `is_command` and
+# `is_flag` decide which surfaces it appears on. /<token> and --<token> are built
+# at use-time. /help shows is_command entries; --help shows is_flag entries.
+COMMANDS = [
+    Command(flag_command=("help",),
+            help="",
+            run=cmd_help,
+            is_flag=False),                 # --help is argparse's builtin
+    Command(flag_command=("exit", "quit"),
+            help="Exit MatthewCode",
+            run=cmd_exit,
+            is_flag=False),                 # --exit would be a no-op
+    Command(flag_command=("clear",),
+            help="Delete all conversation history.",
+            run=cmd_clear,
+            one_shot=True),
+    Command(flag_command=("history",),
+            help="Print session history.",
+            run=cmd_history,
+            one_shot=True),
+    Command(flag_command=("rebirth",),
+            help="Ask the LLM to summarize the session. Delete all conversation history and replace with the summary.",
+            run=cmd_rebirth,
+            is_flag=False),
+    Command(flag_command=("session",),
+            help="Switch to session <arg>. If none exists, create new session named <arg>.",
+            run=cmd_session,
+            arghint="[<arg>]",
+            arg_values=_list_session_names,
+            flag_kwargs={"dest": "resume_name", "default": None, "metavar": "<arg>"}),
+    Command(flag_command=("session-rename",),
+            help="Set this current session's name to <arg>.",
+            run=cmd_name,
+            arghint="[<arg>]",
+            is_flag=False),
+    Command(flag_command=("sessions-list",),
+            help="List all sessions.",
+            run=cmd_session,
+            one_shot=True),
+    Command(flag_command=("provider",),
+            help="Switch to provider <arg>.",
+            run=cmd_provider,
+            arghint="[<arg>]",
+            arg_values=LLMConnection.list_providers,
+            flag_kwargs={"default": "default", "metavar": "<arg>"}),
+    Command(flag_command=("providers-list",),
+            help="List all providers.",
+            run=cmd_provider,
+            one_shot=True),
+    Command(flag_command=("verbose",),
+            help="Toogle displaying of detailed tool calls.",
+            run=cmd_verbose,
+            flag_kwargs={"action": "store_true", "default": CONFIG.get("verbose", False)}),
+    Command(flag_command=("kill",),
+            help="Terminate the active LLM. Works for local ollama serve or slurm job.",
+            run=cmd_kill_model,
+            needs_client=True,
+            one_shot=True),
+    Command(flag_command=("diagnose",),
+            help="Provider connection diagnostics.",
+            run=cmd_diagnose,
+            needs_client=True,
+            one_shot=True),
+    Command(flag_command=("yes",),
+            help="Toggle approval of tool calls.",
+            run=cmd_yes,
+            flag_kwargs={"action": "store_true", "default": CONFIG.get("auto_approve", True)}),
+    Command(flag_command=("prompt",),
+            help="Run a single prompt non-interactively then exit.",
+            flag_kwargs={"nargs": "?", "const": "-", "default": None, "metavar": "<prompt>"},
+            is_command=False),
+]
+COMMAND_BY_TOKEN = {tok: c for c in COMMANDS if c.is_command for tok in c.flag_command}
+
+
+def _flag_dest(c):
+    """argparse dest for an is_flag entry: explicit flag_kwargs['dest'], else the
+    first bare token with dashes normalized (e.g. 'kill-model' → 'kill_model')."""
+    return c.flag_kwargs.get("dest") or c.flag_command[0].replace("-", "_")
+
+
+def try_dispatch_command(user_input, ctx):
+    """If `user_input` is a registered /command, run it against `ctx` and return
+    True; otherwise return False. This is the ONE dispatch path, shared by the
+    interactive REPL and the one-shot --prompt mode — so every command is reachable
+    from both, with no per-mode or per-command special-casing to maintain."""
+    if not user_input.startswith("/"):
+        return False
+    head, _, raw_arg = user_input[1:].partition(" ")
+    cmd = COMMAND_BY_TOKEN.get(head)
+    if cmd is None:
+        return False
+    cmd.run(ctx, raw_arg.strip())
+    return True
+
+
+def _completer_from_commands():
+    """Build the REPL TAB completer from the command registry."""
+    return build_slash_completer(
+        [f"/{tok}" for c in COMMANDS if c.is_command for tok in c.flag_command],
+        arg_value_funcs={
+            f"/{tok}": c.arg_values
+            for c in COMMANDS if c.is_command and c.arg_values
+            for tok in c.flag_command
+        },
+    )
+
+
+# --- Shared turn handling (REPL and --prompt run the SAME path) ----------------
+# A line of input is processed identically in both modes; `interactive` gates only
+# presentation/safety (animation, stdout-vs-stderr, tool confirmation, rendering).
+
+
+def _execute_tool_calls(calls, ctx, detector, *, interactive, assistant_content):
+    """Append the assistant tool_calls message + paired tool results for `calls`
+    (a list of (name, args_dict)). Returns True if the turn should stop (a tool was
+    rejected). The single tool-execution path, shared by the fallback + native paths
+    and both modes — keeps the strict-provider id pairing in exactly one place."""
+    ctx.messages.append({
+        "role": "assistant",
+        "content": assistant_content,
+        "tool_calls": [
+            {"id": f"call_{i}", "type": "function",
+             "function": {"name": name, "arguments": args}}
+            for i, (name, args) in enumerate(calls)
+        ],
+    })
+    for i, (name, args) in enumerate(calls):
+        call_id = f"call_{i}"
+        if interactive:
+            if ctx.args.verbose:
+                print(f"{DIM}[tool: {name}({json.dumps(args, indent=2)})]{RESET}")
+            else:
+                print(f"{DIM}[{name}: {_tool_summary(name, args)}]{RESET}")
+        else:
+            print(f"[{name}: {_tool_summary(name, args)}]", file=sys.stderr)
+
+        # Tool-safety confirmation is interactive-only — non-interactive (--prompt)
+        # has no TTY to confirm at, so it auto-executes (caller opted in via --prompt).
+        if interactive:
+            protected = CONFIG.get("rules", {}).get("protected_paths", [])
+            tool_path = args.get("path", "")
+            is_safe = name in SAFE_TOOLS and not is_protected_path(tool_path, protected)
+            restricted = is_restricted_bash(name, args)
+            if restricted or (not is_safe and not ctx.args.yes):
+                if not confirm_tool(name, args, restricted=restricted):
+                    ctx.messages.append({"role": "tool", "tool_call_id": call_id,
+                                         "content": get_prompt("pipeline_tool_rejected", "message")})
+                    # answer the remaining declared call ids so the block stays paired
+                    for j in range(i + 1, len(calls)):
+                        ctx.messages.append({"role": "tool", "tool_call_id": f"call_{j}",
+                                             "content": get_prompt("pipeline_tool_skipped", "message")})
+                    return True
+
+        if name in TOOL_DISPATCH:
+            t0 = time.time()
+            result = TOOL_DISPATCH[name](args)
+            if interactive:
+                rc = len(result)
+                print(f"{DIM}  → {rc} chars ({rc // 4} tokens) in {time.time() - t0:.1f}s{RESET}")
+        else:
+            result = get_prompt("pipeline_tool_errors", "unknown_tool", name=name)
+
+        if detector.record(name, args, result):
+            if interactive:
+                print(f"{YELLOW}  ⚠ loop detected — nudging model{RESET}")
+            result += get_prompt("pipeline_loop_detected", "message", name=name, count=detector.threshold)
+            detector.reset()
+        ctx.messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
+
+        if interactive and ctx.args.verbose:
+            preview = result[:500] + ("..." if len(result) > 500 else "")
+            print(f"{DIM}{preview}{RESET}")
+    return False
+
+
+def run_agent_loop(ctx, *, interactive):
+    """Run the chat→tools loop for the latest user message in ctx.messages until the
+    model produces a final response or max_iters. `interactive` gates only the
+    animation, output target, tool confirmation, and rendering."""
+    max_iters = CONFIG.get("max_iterations", 10)
+    detector = make_loop_detector()
+    for _iter in range(max_iters):
+        try:
+            # safety net: repair malformed tool-call pairing before a strict provider
+            ctx.messages = sanitize_messages(ctx.messages, quiet=True)
+            response = ctx.client.chat(ctx.messages, tools=TOOLS, stream=True)
+
+            full_content = ""
+            tool_calls = []
+            if interactive:
+                llama_frames = ["🦙      ", "  🦙    ", "    🦙  "]
+                bubble_frames = ["·", "∘", "○", "◎", "◉", "◎", "○", "∘"]
+                thinking_word = random.choice(THINKING_WORDS)
+                next_word_change = time.time() + random.uniform(5, 20)
+                start_time = time.time()
+                frame_idx = 0
+                chunk_count = 0
+            for chunk in response:
+                if chunk.text:
+                    full_content += chunk.text
+                    if interactive:
+                        chunk_count += 1
+                        if chunk_count % 3 == 0:
+                            frame = llama_frames[frame_idx % len(llama_frames)]
+                            bubble = bubble_frames[int(time.time() - start_time) % len(bubble_frames)]
+                            elapsed = int(time.time() - start_time)
+                            sys.stdout.write(f"\r{frame}{bubble} {thinking_word}... ({elapsed}s, {chunk_count} tokens)   ")
+                            sys.stdout.flush()
+                            frame_idx += 1
+                            if time.time() >= next_word_change:
+                                thinking_word = random.choice(THINKING_WORDS)
+                                next_word_change = time.time() + random.uniform(5, 20)
+                if chunk.tool_calls:
+                    tool_calls.extend(chunk.tool_calls)
+
+            if not full_content:
+                full_content = response.text
+            if not tool_calls:
+                tool_calls = response.tool_calls
+            if response.prompt_tokens:
+                ctx.ctx_tokens = max(ctx.ctx_tokens, response.prompt_tokens)
+            if interactive:
+                sys.stdout.write("\r\033[K")  # clear the llama animation
+
+            # Fallback text parsing → synthesize tool calls
+            if not tool_calls and full_content:
+                fallback = parse_tool_calls_from_text(full_content)
+                if fallback:
+                    if interactive:
+                        print(f"{DIM}(parsed tool call from text){RESET}")
+                    calls = [(name, a if isinstance(a, dict) else json.loads(a))
+                             for name, a in fallback]
+                    if _execute_tool_calls(calls, ctx, detector, interactive=interactive,
+                                           assistant_content=full_content):
+                        break
+                    continue
+
+            # No tool calls — final response, done
+            if not tool_calls:
+                if full_content:
+                    if interactive:
+                        render_markdown(full_content)
+                    else:
+                        print(full_content)   # clean stdout for autonomous callers
+                    ctx.messages.append({"role": "assistant", "content": full_content})
+                save_history(ctx.messages, ctx.session_file)
+                break
+
+            # Native tool calls
+            calls = [(tc["name"], tc["arguments"] if isinstance(tc["arguments"], dict)
+                      else json.loads(tc["arguments"]))
+                     for tc in tool_calls]
+            if _execute_tool_calls(calls, ctx, detector, interactive=interactive,
+                                   assistant_content=(full_content or "")):
+                break
+
+        except KeyboardInterrupt:
+            if interactive:
+                print(f"\n{DIM}(interrupted){RESET}")
+            break
+        except Exception as e:
+            err_str = str(e)
+            if interactive:
+                print(f"\n{RED}Error: {err_str}{RESET}")
+            else:
+                print(f"Error: {err_str}", file=sys.stderr)
+            if any(code in err_str for code in ("400", "401", "422")):
+                # gentle sanitize, then roll back to the last user message
+                ctx.messages = sanitize_messages(ctx.messages)
+                while len(ctx.messages) > 1 and ctx.messages[-1]["role"] != "user":
+                    ctx.messages.pop()
+                save_history(ctx.messages, ctx.session_file)
+                if interactive:
+                    print(f"{DIM}(rolled back to last clean state — try again){RESET}")
+            break
+    else:
+        if interactive:
+            print(f"\n{YELLOW}(stopped after {max_iters} iterations){RESET}")
+        else:
+            print(f"(stopped after {max_iters} iterations)", file=sys.stderr)
+
+
+def handle_input(user_input, ctx, *, interactive):
+    """Process one line of input: dispatch a /command, or run an agent turn. The
+    one path shared by the interactive REPL and the one-shot --prompt mode."""
+    if try_dispatch_command(user_input, ctx):
+        return
+    ctx.messages.append({"role": "user",
+                         "content": get_prompt("pipeline_main", "user_prompt", user_input=user_input)})
+    run_agent_loop(ctx, interactive=interactive)
+
+
 # --- Main ---
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="MatthewCode - Local LLM coding assistant",
+        description="MatthewCode - Matthew Hamilton's personal agentic coding assistant.",
         epilog=_providers_help_text(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        add_help=False,   # we add our own -h/--help so its text is configurable
     )
-    parser.add_argument("--provider", default="default", help="LLM provider name from config")
-    parser.add_argument("--yes", "-y", action="store_true",
-                        default=CONFIG.get("auto_approve", False), help="Auto-approve all tool calls")
-    parser.add_argument("--continue", "-c", dest="resume", action="store_true",
-                        help="Resume last conversation")
-    parser.add_argument("--session", "-s", dest="resume_name", default=None,
-                        help="Open or create a named session (e.g. --session myproject)")
-    parser.add_argument("--verbose", "-v", action="store_true",
-                        default=CONFIG.get("verbose", False), help="Show tool call details")
-    parser.add_argument("--pipe", action="store_true",
-                        help="Pipe mode: read one prompt from stdin, run, print output, exit")
+    # -h/--help: argparse's help action, but the description comes from the registry's
+    # `help` command (so it's configurable like every other flag, not hardcoded).
+    _help_cmd = COMMAND_BY_TOKEN.get("help")
+    parser.add_argument("-h", "--help", action="help",
+                        help=_help_cmd.help if _help_cmd else "Show this help and exit")
+    # argparse is generated entirely from the one COMMANDS list — every is_flag entry,
+    # with `--` added to its bare token(s), using the single `help` /help also shows.
+    for c in COMMANDS:
+        if c.is_flag:
+            kwargs = dict(c.flag_kwargs)
+            if c.one_shot:                      # a one-shot flag is a boolean trigger
+                kwargs.setdefault("action", "store_true")
+            parser.add_argument(*[f"--{t}" for t in c.flag_command], help=c.help, **kwargs)
     args = parser.parse_args()
+
+    # Every one-shot `--flag` and --prompt is a "run once and exit" mode — they are
+    # mutually exclusive. Collect all that are set and reject if more than one.
+    active = [c for c in COMMANDS if c.one_shot and getattr(args, _flag_dest(c))]
+    modes = [f"--{c.flag_command[0]}" for c in active]
+    if args.prompt is not None:
+        modes.append("--prompt")
+    if len(modes) > 1:
+        print(f"{RED}[Error] Pick one. These cannot be logically combined: "
+              f"{', '.join(modes)}{RESET}", file=sys.stderr)
+        sys.exit(2)
+    oneshot = active[0] if active else None
+
+    # A one-shot `--flag` runs its matching command once and exits. Offline commands
+    # run here, before any provider/Slurm spin-up; client commands run after setup.
+    if oneshot is not None and not oneshot.needs_client:
+        if args.resume_name:
+            _s_name, _s_file = args.resume_name, session_path(args.resume_name)
+        else:
+            _s_name, _s_file = None, session_path()
+        _msgs = load_history(_s_file) if os.path.isfile(_s_file) else []
+        _ctx = ReplContext(args=args, console=console, client=None, messages=_msgs,
+                           session_name=_s_name, session_file=_s_file, ctx_tokens=0)
+        oneshot.run(_ctx, "")
+        # Persist whatever the command did to the session, so ANY state-mutating
+        # one-shot (clear, and future ones) saves automatically — no per-command
+        # save needed. Read-only one-shots just re-write the same content (harmless).
+        save_history(_ctx.messages, _ctx.session_file)
+        sys.exit(0)
 
     # Load providers after argparse so --help is instant
     load_providers(args.provider)
@@ -918,7 +1558,6 @@ def main():
         sys.exit(1)
 
     session_name = None
-    resume_existing = False
     if args.resume_name:
         session_name = args.resume_name
         session_file = session_path(session_name)
@@ -932,35 +1571,25 @@ def main():
             os.makedirs(HISTORY_DIR, exist_ok=True)
             os.rename(legacy, session_path())
         session_file = session_path()
-        # Starting fresh while a last session exists for this directory would
-        # silently overwrite it on the first save. Guard against that. Gated on
-        # an interactive TTY so pipe mode doesn't consume the piped prompt.
-        if not args.resume and sys.stdin.isatty() and os.path.isfile(session_file):
-            try:
-                answer = input(f"{YELLOW}Last session exists for this directory. Overwrite with new session? [y/N] {RESET}").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                answer = ""
-            if answer not in ("y", "yes"):
-                resume_existing = True
-                print(f"{DIM}Keeping existing session.{RESET}")
 
-    messages = []
-    if args.resume or args.resume_name or resume_existing:
-        messages = load_history(session_file)
-        if messages:
-            messages = sanitize_messages(messages)
-            if session_name:
-                print(f"{DIM}Resumed session '{session_name}' ({len(messages)} messages){RESET}")
-            else:
-                print(f"{DIM}Resumed last unnamed session ({len(messages)} messages){RESET}")
-            # Add a separator so the model treats the next input as a fresh request
-            if messages[-1]["role"] != "user":
-                messages.append({
-                    "role": "system",
-                    "content": get_prompt("pipeline_session_resume", "system_prompt"),
-                })
-
-    if not messages:
+    # Always resume the session for this directory — continuing is the default.
+    # (Run /clear for a fresh start.)
+    messages = load_history(session_file)
+    if messages:
+        messages = sanitize_messages(messages)
+        if oneshot is not None or args.prompt is not None:
+            pass  # one-shot / --prompt: keep stdout clean for the actual output
+        elif session_name:
+            print(f"{DIM}Resumed session '{session_name}' ({len(messages)} messages){RESET}")
+        else:
+            print(f"{DIM}Resumed last session ({len(messages)} messages){RESET}")
+        # Add a separator so the model treats the next input as a fresh request
+        if messages[-1]["role"] != "user":
+            messages.append({
+                "role": "system",
+                "content": get_prompt("pipeline_session_resume", "system_prompt"),
+            })
+    else:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     num_ctx = getattr(client, '_provider', None) and client._provider.config.get("num_ctx", 0) or 0
@@ -1013,7 +1642,7 @@ def main():
         ("         ·•◉",  0),
         ("          ·•◉", 0),  # spit frozen in mid-air — final frame stays on screen
     ]
-    if not args.pipe:
+    if args.prompt is None and oneshot is None:
         num_lines = len(BASE_LLAMA)
         for step, (spit, shake) in enumerate(SPIT_SEQUENCE):
             if step:
@@ -1029,121 +1658,46 @@ def main():
         print(f"{DIM}Type /help for commands | {ctx_display}{RESET}")
         print()
 
-    max_iters = CONFIG.get("max_iterations", 10)
     os.makedirs(HISTORY_DIR, exist_ok=True)
 
     # Pipe mode: read one prompt from stdin, run, output, exit
-    if args.pipe:
-        user_input = sys.stdin.read().strip()
+    if args.prompt is not None:
+        args.yes = True  # auto-approve: no TTY to confirm at in --prompt mode
+        user_input = sys.stdin.read().strip() if args.prompt == "-" else args.prompt
         if not user_input:
             print("No input received.", file=sys.stderr)
             sys.exit(1)
-        args.yes = True  # auto-approve in pipe mode
-        formatted_input = get_prompt("pipeline_main", "user_prompt", user_input=user_input)
-        messages.append({"role": "user", "content": formatted_input})
+        # Same path as the REPL: a /command dispatches, anything else runs the agent
+        # loop — non-interactively (clean stdout, no animation), then we exit.
+        ctx = ReplContext(args=args, console=console, client=client, messages=messages,
+                          session_name=session_name, session_file=session_file,
+                          ctx_tokens=ctx_tokens)
+        handle_input(user_input, ctx, interactive=False)
+        save_history(ctx.messages, ctx.session_file)
+        sys.exit(0)
 
-        detector = make_loop_detector()
-        for _iter in range(max_iters):
-            try:
-                # safety net: repair any malformed tool-call pairing before it
-                # reaches a strict provider. quiet so clean iterations stay
-                # silent; real cleanups still print
-                messages = sanitize_messages(messages, quiet=True)
-                response = client.chat(messages, tools=TOOLS, stream=True)
-                full_content = ""
-                tool_calls = []
-                for chunk in response:
-                    if chunk.text:
-                        full_content += chunk.text
-                    if chunk.tool_calls:
-                        tool_calls.extend(chunk.tool_calls)
-                if not full_content:
-                    full_content = response.text
-                if not tool_calls:
-                    tool_calls = response.tool_calls
-
-                # fallback text parsing; synthesize a proper assistant tool_calls
-                # block + matching tool_call_id results so the payload stays valid
-                # on strict providers and survives sanitize/reload
-                if not tool_calls and full_content:
-                    fallback = parse_tool_calls_from_text(full_content)
-                    if fallback:
-                        assistant_msg = {"role": "assistant", "content": full_content}
-                        assistant_msg["tool_calls"] = [
-                            {"id": f"call_{i}", "type": "function",
-                             "function": {"name": name,
-                                          "arguments": tc_args if isinstance(tc_args, dict) else json.loads(tc_args)}}
-                            for i, (name, tc_args) in enumerate(fallback)
-                        ]
-                        messages.append(assistant_msg)
-                        for i, (name, tc_args) in enumerate(fallback):
-                            call_id = f"call_{i}"
-                            print(f"[{name}: {_tool_summary(name, tc_args)}]", file=sys.stderr)
-                            result = TOOL_DISPATCH[name](tc_args)
-                            if detector.record(name, tc_args, result):
-                                result += get_prompt("pipeline_loop_detected", "message", name=name, count=detector.threshold)
-                                detector.reset()
-                            messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
-                        continue
-
-                if not tool_calls:
-                    if full_content:
-                        messages.append({"role": "assistant", "content": full_content})
-                    break
-
-                # Execute native tool calls
-                assistant_msg = {"role": "assistant", "content": full_content or ""}
-                assistant_msg["tool_calls"] = [
-                    {"id": f"call_{i}", "type": "function",
-                     "function": {"name": tc["name"],
-                                  "arguments": tc["arguments"] if isinstance(tc["arguments"], dict) else json.loads(tc["arguments"])}}
-                    for i, tc in enumerate(tool_calls)
-                ]
-                messages.append(assistant_msg)
-
-                for i, tc in enumerate(tool_calls):
-                    call_id = f"call_{i}"
-                    name = tc["name"]
-                    tc_args = tc["arguments"]
-                    if isinstance(tc_args, str):
-                        tc_args = json.loads(tc_args)
-                    print(f"[{name}: {_tool_summary(name, tc_args)}]", file=sys.stderr)
-                    if name in TOOL_DISPATCH:
-                        result = TOOL_DISPATCH[name](tc_args)
-                    else:
-                        result = get_prompt("pipeline_tool_errors", "unknown_tool", name=name)
-                    if detector.record(name, tc_args, result):
-                        result += get_prompt("pipeline_loop_detected", "message", name=name, count=detector.threshold)
-                        detector.reset()
-                    messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
-
-            except Exception as e:
-                print(f"Error: {e}", file=sys.stderr)
-                break
-
-        # Output the final response and save
-        print(full_content)
-        save_history(messages, session_file)
+    # Client one-shot flags (--diagnose / --kill-model): the model is now set up,
+    # so run the command against it and exit without entering the REPL.
+    if oneshot is not None:
+        oneshot.run(ReplContext(args=args, console=console, client=client,
+                                messages=messages, session_name=session_name,
+                                session_file=session_file, ctx_tokens=ctx_tokens), "")
         sys.exit(0)
 
     pt_history = FileHistory(os.path.join(HISTORY_DIR, "prompt_history"))
-    slash_completer = build_slash_completer(
-        _slash_command_tokens(),
-        arg_value_funcs={
-            "/provider": LLMConnection.list_providers,
-            "/session": _list_session_names,
-            "/sessions": _list_session_names,
-        },
-    )
+    slash_completer = _completer_from_commands()
 
+    ctx = ReplContext(args=args, console=console, client=client, messages=messages,
+                      session_name=session_name, session_file=session_file,
+                      ctx_tokens=ctx_tokens)
     while True:
         try:
-            if ctx_tokens > 0:
-                num_ctx = getattr(client, '_provider', None) and client._provider.config.get("num_ctx", 0) or 0
+            if ctx.ctx_tokens > 0:
+                num_ctx = getattr(ctx.client, '_provider', None) and ctx.client._provider.config.get("num_ctx", 0) or 0
                 if num_ctx:
-                    ctx_info = f"[{ctx_tokens}/{num_ctx} tokens]"
+                    ctx_info = f"[{ctx.ctx_tokens}/{num_ctx} tokens]"
                 else:
-                    ctx_info = f"[{ctx_tokens} tokens]"
+                    ctx_info = f"[{ctx.ctx_tokens} tokens]"
             else:
                 ctx_info = ""
             TEAL = "\033[36m"
@@ -1157,12 +1711,12 @@ def main():
             sep = TEAL + "——" + RESET
             parts = []
             tokens_part = ctx_info.strip() if ctx_info.strip() else ""
-            session_part = session_name if session_name else ""
+            session_part = ctx.session_name if ctx.session_name else ""
             visible_len = right_pad
             if tokens_part:
-                if ctx_tokens >= 200000:
+                if ctx.ctx_tokens >= 200000:
                     token_bg = "\033[5;41;30m"   # blinking red background, black text
-                elif ctx_tokens >= 120000:
+                elif ctx.ctx_tokens >= 120000:
                     token_bg = "\033[5;43;30m"   # blinking yellow background, black text
                 else:
                     token_bg = TEAL_BG
@@ -1191,439 +1745,13 @@ def main():
         if not user_input:
             continue
 
-        # Slash commands
-        if user_input == "/help":
-            print(f"{DIM}Commands:{RESET}")
-            for label, helptext in SLASH_COMMANDS:
-                print(f"  {label:<22}{helptext}")
-            continue
-        elif user_input == "/verbose":
-            args.verbose = not args.verbose
-            print(f"{DIM}Verbose: {'on' if args.verbose else 'off'}{RESET}")
-            continue
-        elif user_input == "/diagnose":
-            import time as _time
-            import urllib.error as _urlerr
-            import urllib.request as _urlreq
-
-            cur = LLMConnection._registry.get(args.provider)
-            base_url = getattr(getattr(cur, "_provider", None), "base_url", None)
-            print(f"{DIM}── /diagnose {args.provider} ──{RESET}")
-            print(f"  base_url: {base_url or '(none)'}")
-
-            def _probe(path: str, timeout: float = 5.0):
-                if not base_url:
-                    return ("?", 0.0, "no base_url")
-                url = base_url.rstrip("/") + path
-                t0 = _time.time()
-                try:
-                    with _urlreq.urlopen(url, timeout=timeout) as r:
-                        body = r.read().decode("utf-8", errors="replace")
-                        return (r.status, _time.time() - t0, body[:500])
-                except _urlerr.HTTPError as e:
-                    return (e.code, _time.time() - t0, str(e))
-                except Exception as e:
-                    return ("ERR", _time.time() - t0, f"{type(e).__name__}: {e}")
-
-            for path in ("/api/tags", "/api/ps"):
-                code, dt, body = _probe(path)
-                color = GREEN if code == 200 else RED
-                print(f"  {color}{path:<10} {code} ({dt*1000:.0f}ms){RESET}")
-                if body and code != 200:
-                    print(f"    {DIM}{body}{RESET}")
-                elif body and code == 200 and path == "/api/ps":
-                    # Show loaded models — most useful diagnostic for "why is chat hanging"
-                    print(f"    {DIM}{body}{RESET}")
-
-            from llm_connections import SlurmSession
-            handle = SlurmSession.active_by_local_url(base_url) if base_url else None
-            if handle is not None:
-                print(f"  {DIM}Slurm: cluster={handle.cluster}, job={handle.job_id}, "
-                      f"remote={handle.remote_host}:{handle.remote_port}, gpu={handle.gpu_info}{RESET}")
-                print(f"  {DIM}Check the job manually:{RESET}")
-                print(f"    ssh {handle.ssh_target} 'squeue -j {handle.job_id}; "
-                      f"tail -50 ~/log/{handle.name}-{handle.job_id}.log'")
-            elif base_url and ("localhost" in base_url or "127.0.0.1" in base_url):
-                print(f"  {DIM}Local Ollama; if /api/tags hangs run 'pkill ollama' and restart.{RESET}")
-            continue
-        elif user_input == "/kill-model":
-            cur = LLMConnection._registry.get(args.provider)
-            base_url = getattr(getattr(cur, "_provider", None), "base_url", None)
-            killed_what = None
-
-            from llm_connections import SlurmSession
-            handle = SlurmSession.active_by_local_url(base_url) if base_url else None
-            if handle is not None:
-                handle.kill()
-                killed_what = f"Slurm job {handle.job_id} on cluster {handle.cluster}"
-            elif base_url and ("localhost" in base_url or "127.0.0.1" in base_url):
-                from llm_connections.llm_providers.ollama import kill_local_server
-                if kill_local_server():
-                    killed_what = "local ollama serve"
-                else:
-                    print(f"{YELLOW}No local 'ollama serve' process was running.{RESET}")
-            else:
-                print(
-                    f"{YELLOW}Provider '{args.provider}' is at {base_url or '?'}; "
-                    f"not managed by matthewcode (not local, no Slurm session).{RESET}"
-                )
-
-            if killed_what:
-                print(f"{GREEN}/kill-model: terminated {killed_what}.{RESET}")
-                # Don't mark provider as permanently failed - check connectivity on next use
-            continue
-        elif user_input in ("/exit", "/quit"):
-            print(f"{DIM}Bye!{RESET}")
+        # The one shared path: dispatch a /command, or run an agent turn — exactly
+        # what --prompt does, just interactive=True (animation, confirmation, render).
+        handle_input(user_input, ctx, interactive=True)
+        if ctx.should_exit:
             break
-        elif user_input == "/clear":
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-            session_name = None
-            session_file = session_path()
-            ctx_tokens = 0
-            print(f"{DIM}Conversation cleared.{RESET}")
-            continue
-        elif user_input == "/history":
-            import tempfile
-            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
-                json.dump(messages, tf, indent=2, default=str)
-                tmp = tf.name
-            try:
-                subprocess.run(["less", "+G", tmp])
-            except FileNotFoundError:
-                print(f"{RED}'less' not found on PATH.{RESET}")
-            finally:
-                os.unlink(tmp)
-            continue
-        elif user_input == "/rebirth":
-            if len(messages) <= 2:
-                print(f"{DIM}Nothing to compress.{RESET}")
-                continue
-            RED_LINE = "\033[31m"
-            RED_BG = "\033[41;30m"
-            try:
-                tw_r = os.get_terminal_size().columns
-            except OSError:
-                tw_r = 80
-            rebirth_text = " Now I must destroy myself to be born again anew... 🧎 "
-            # Emoji takes 2 columns
-            visible_len = len(rebirth_text) + 1
-            dash_len = tw_r - visible_len
-            print(RED_BG + rebirth_text + RESET + RED_LINE + "—" * max(dash_len, 0) + RESET)
-            # Use the exact same chat path as normal prompts
-            try:
-                rebirth_prompt = get_prompt("pipeline_rebirth", "user_prompt")
-                messages.append({"role": "user", "content": rebirth_prompt})
-                old_count = len(messages) - 1
-                old_tokens = ctx_tokens
 
-                # summarize with a dedicated system prompt and no tools so the
-                # summary comes back as text, not file_write calls
-                rebirth_system = get_prompt("pipeline_rebirth", "system_prompt")
-                summarize_messages = [
-                    {"role": "system", "content": rebirth_system}
-                ] + messages[1:]
-                response = client.chat(summarize_messages, tools=None, stream=True)
-                summary_text = ""
-                for chunk in response:
-                    if chunk.text:
-                        summary_text += chunk.text
-                if not summary_text:
-                    summary_text = response.text
-                summary_text = summary_text.strip()
-
-                if not summary_text:
-                    messages.pop()  # remove rebirth prompt
-                    print(f"{RED}Failed to generate summary.{RESET}")
-                    continue
-
-                # Rebuild messages: system + summary + last N user messages
-                num_kept = CONFIG.get("pipeline_rebirth", {}).get("num_messages_kept", 5)
-                # Keep last N messages of any role (user, assistant, tool)
-                # Skip the rebirth prompt we just added
-                recent_msgs = []
-                for msg in reversed(messages):
-                    if msg.get("content", "").startswith("Summarize this"):
-                        continue
-                    recent_msgs.insert(0, msg)
-                    if len(recent_msgs) >= num_kept:
-                        break
-                # The count-based slice can start mid tool-call exchange. A leading
-                # 'tool' result whose parent assistant+tool_calls was sliced off is
-                # an orphan that litellm/OpenAI reject. Drop leading orphans so the
-                # window starts on a clean boundary (a user or assistant message).
-                while recent_msgs and recent_msgs[0].get("role") == "tool":
-                    recent_msgs.pop(0)
-                messages = [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "system", "content": f"Previous conversation summary:\n{summary_text}"},
-                    {"role": "system", "content": f"The following {len(recent_msgs)} message(s) are the most recent user requests from before the conversation was compressed:"},
-                ] + recent_msgs
-                # Sanitize the rebuilt list before persisting — rebirth previously
-                # saved directly, so malformed tool sequences were never checked.
-                messages = sanitize_messages(messages)
-                ctx_tokens = 0
-                save_history(messages, session_file)
-                print(f"{DIM}Rebirth complete: {old_count} messages → {len(messages)}, "
-                      f"{old_tokens} tokens → {len(summary_text)} chars{RESET}")
-                render_markdown(summary_text)
-            except Exception as e:
-                print(f"{RED}Rebirth failed: {e}{RESET}")
-            continue
-        elif user_input.startswith("/name ") or user_input.startswith("/rename "):
-            new_name = user_input.split(" ", 1)[1].strip()
-            if not new_name:
-                print(f"{RED}Usage: /name <session_name>{RESET}")
-                continue
-            new_file = session_path(new_name)
-            if os.path.isfile(new_file) and new_name != session_name:
-                try:
-                    answer = input(f"{YELLOW}Session '{new_name}' exists. Overwrite? [y/N] {RESET}").strip().lower()
-                    if answer not in ("y", "yes"):
-                        print(f"{DIM}Cancelled.{RESET}")
-                        continue
-                except (EOFError, KeyboardInterrupt):
-                    print()
-                    continue
-            session_name = new_name
-            session_file = new_file
-            save_history(messages, session_file)
-            print(f"{DIM}Session saved as '{session_name}'{RESET}")
-            continue
-        elif user_input in ("/name", "/rename"):
-            if session_name:
-                print(f"{DIM}Current session: '{session_name}'{RESET}")
-            else:
-                print(f"{DIM}Session unnamed. Usage: /name <session_name>{RESET}")
-            continue
-        elif user_input == "/sessions" or user_input == "/session":
-            sessions = _list_session_names()
-            if sessions:
-                print(f"{DIM}Saved sessions:{RESET}")
-                for s in sessions:
-                    marker = f" {CYAN}<- active{RESET}" if s == (session_name or "last_session") else ""
-                    msgs = load_history(session_path(s))
-                    print(f"  {s} ({len(msgs)} messages){marker}")
-            else:
-                print(f"{DIM}No saved sessions.{RESET}")
-            continue
-        elif user_input.startswith("/session "):
-            new_session = user_input.split(" ", 1)[1].strip()
-            if not new_session:
-                print(f"{RED}Usage: /session <name>{RESET}")
-                continue
-            # Save current session before switching
-            save_history(messages, session_file)
-            # Switch to new session
-            session_name = new_session
-            session_file = session_path(session_name)
-            if os.path.isfile(session_file):
-                messages = load_history(session_file)
-                messages = sanitize_messages(messages)
-                print(f"{DIM}Switched to '{session_name}' ({len(messages)} messages){RESET}")
-            else:
-                messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-                print(f"{DIM}Created new session '{session_name}'{RESET}")
-            ctx_tokens = 0
-            continue
-        elif user_input == "/provider":
-            print(f"{DIM}Available providers:{RESET}")
-            for name in LLMConnection.list_providers():
-                p = LLMConnection.get(name)
-                marker = f" {CYAN}<- active{RESET}" if name == args.provider else ""
-                print(f"  {name} ({p.model}){marker}")
-            continue
-        elif user_input.startswith("/provider "):
-            name = user_input.split(" ", 1)[1].strip()
-            try:
-                client = LLMConnection.get(name)
-                args.provider = name
-                print(f"{DIM}Switched to {client}{RESET}")
-            except KeyError as e:
-                print(f"{RED}{e}{RESET}")
-            continue
-
-        formatted_input = get_prompt("pipeline_main", "user_prompt", user_input=user_input)
-        messages.append({"role": "user", "content": formatted_input})
-
-        # Agent loop
-        detector = make_loop_detector()
-        for _iter in range(max_iters):
-            try:
-                # safety net: repair any malformed tool-call pairing before it
-                # reaches a strict provider. quiet so clean iterations stay
-                # silent; real cleanups still print
-                messages = sanitize_messages(messages, quiet=True)
-                # Use llm_connections for the chat call
-                response = client.chat(messages, tools=TOOLS, stream=True)
-
-                full_content = ""
-                tool_calls = []
-                llama_frames = ["🦙      ", "  🦙    ", "    🦙  "]
-                bubble_frames = ["·", "∘", "○", "◎", "◉", "◎", "○", "∘"]
-                thinking_word = random.choice(THINKING_WORDS)
-                next_word_change = time.time() + random.uniform(5, 20)
-                start_time = time.time()
-                frame_idx = 0
-                chunk_count = 0
-                for chunk in response:
-                    if chunk.text:
-                        full_content += chunk.text
-                        chunk_count += 1
-                        if chunk_count % 3 == 0:
-                            frame = llama_frames[frame_idx % len(llama_frames)]
-                            bubble = bubble_frames[int(time.time() - start_time) % len(bubble_frames)]
-                            elapsed = int(time.time() - start_time)
-                            sys.stdout.write(f"\r{frame}{bubble} {thinking_word}... ({elapsed}s, {chunk_count} tokens)   ")
-                            sys.stdout.flush()
-                            frame_idx += 1
-                            if time.time() >= next_word_change:
-                                thinking_word = random.choice(THINKING_WORDS)
-                                next_word_change = time.time() + random.uniform(5, 20)
-                    if chunk.tool_calls:
-                        tool_calls.extend(chunk.tool_calls)
-
-                # After stream: grab accumulated values
-                if not full_content:
-                    full_content = response.text
-                if not tool_calls:
-                    tool_calls = response.tool_calls
-
-                # Track context window usage (prompt_tokens = full input context)
-                if response.prompt_tokens:
-                    ctx_tokens = max(ctx_tokens, response.prompt_tokens)
-
-                # Clear the llama animation
-                sys.stdout.write("\r\033[K")
-
-                # No native tool calls — try fallback text parsing BEFORE rendering
-                if not tool_calls and full_content:
-                    fallback = parse_tool_calls_from_text(full_content)
-                    if fallback:
-                        print(f"{DIM}(parsed tool call from text){RESET}")
-                        # synthesize a proper assistant tool_calls block so every
-                        # call has an id that a tool result can answer
-                        assistant_msg = {"role": "assistant", "content": full_content}
-                        assistant_msg["tool_calls"] = [
-                            {"id": f"call_{i}", "type": "function",
-                             "function": {"name": name,
-                                          "arguments": tc_args if isinstance(tc_args, dict) else json.loads(tc_args)}}
-                            for i, (name, tc_args) in enumerate(fallback)
-                        ]
-                        messages.append(assistant_msg)
-                        rejected = False
-                        for i, (name, tc_args) in enumerate(fallback):
-                            call_id = f"call_{i}"
-                            print(f"{DIM}[{name}: {_tool_summary(name, tc_args)}]{RESET}")
-                            protected = CONFIG.get("rules", {}).get("protected_paths", [])
-                            tool_path = tc_args.get("path", "")
-                            is_safe = name in SAFE_TOOLS and not is_protected_path(tool_path, protected)
-                            restricted = is_restricted_bash(name, tc_args)
-                            if restricted or (not is_safe and not args.yes):
-                                if not confirm_tool(name, tc_args, restricted=restricted):
-                                    messages.append({"role": "tool", "tool_call_id": call_id, "content": get_prompt("pipeline_tool_rejected", "message")})
-                                    # answer the remaining declared call ids so the
-                                    # assistant tool_calls block stays fully paired
-                                    for j in range(i + 1, len(fallback)):
-                                        messages.append({"role": "tool", "tool_call_id": f"call_{j}", "content": get_prompt("pipeline_tool_skipped", "message")})
-                                    rejected = True
-                                    break
-                            result = TOOL_DISPATCH[name](tc_args)
-                            if detector.record(name, tc_args, result):
-                                result += get_prompt("pipeline_loop_detected", "message", name=name, count=detector.threshold)
-                                detector.reset()
-                            messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
-                        if rejected:
-                            break
-                        continue
-
-                # No tool calls at all — done, render the response
-                if not tool_calls:
-                    if full_content:
-                        render_markdown(full_content)
-                        messages.append({"role": "assistant", "content": full_content})
-                    save_history(messages, session_file)
-                    break
-
-                # Add assistant message with tool calls
-                assistant_msg = {"role": "assistant", "content": full_content or ""}
-                assistant_msg["tool_calls"] = [
-                    {
-                        "id": f"call_{i}",
-                        "type": "function",
-                        "function": {
-                            "name": tc["name"],
-                            "arguments": tc["arguments"] if isinstance(tc["arguments"], dict) else json.loads(tc["arguments"]),
-                        },
-                    }
-                    for i, tc in enumerate(tool_calls)
-                ]
-                messages.append(assistant_msg)
-
-                # Execute tool calls
-                for i, tc in enumerate(tool_calls):
-                    call_id = f"call_{i}"
-                    name = tc["name"]
-                    tc_args = tc["arguments"]
-                    if isinstance(tc_args, str):
-                        tc_args = json.loads(tc_args)
-
-                    if args.verbose:
-                        print(f"{DIM}[tool: {name}({json.dumps(tc_args, indent=2)})]{RESET}")
-                    else:
-                        print(f"{DIM}[{name}: {_tool_summary(name, tc_args)}]{RESET}")
-
-                    protected = CONFIG.get("rules", {}).get("protected_paths", [])
-                    tool_path = tc_args.get("path", "")
-                    is_safe = name in SAFE_TOOLS and not is_protected_path(tool_path, protected)
-                    restricted = is_restricted_bash(name, tc_args)
-                    if restricted or (not is_safe and not args.yes):
-                        if not confirm_tool(name, tc_args, restricted=restricted):
-                            messages.append({"role": "tool", "tool_call_id": call_id, "content": get_prompt("pipeline_tool_rejected", "message")})
-                            # answer the remaining declared call ids so the
-                            # assistant tool_calls block stays fully paired
-                            for j in range(i + 1, len(tool_calls)):
-                                messages.append({"role": "tool", "tool_call_id": f"call_{j}", "content": get_prompt("pipeline_tool_skipped", "message")})
-                            break
-
-                    if name in TOOL_DISPATCH:
-                        tool_start = time.time()
-                        result = TOOL_DISPATCH[name](tc_args)
-                        tool_elapsed = time.time() - tool_start
-                        result_chars = len(result)
-                        result_tokens_est = result_chars // 4
-                        print(f"{DIM}  → {result_chars} chars ({result_tokens_est} tokens) in {tool_elapsed:.1f}s{RESET}")
-                    else:
-                        result = get_prompt("pipeline_tool_errors", "unknown_tool", name=name)
-                    if detector.record(name, tc_args, result):
-                        print(f"{YELLOW}  ⚠ loop detected — nudging model{RESET}")
-                        result += get_prompt("pipeline_loop_detected", "message", name=name, count=detector.threshold)
-                        detector.reset()
-                    messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
-
-                    if args.verbose:
-                        preview = result[:500] + ("..." if len(result) > 500 else "")
-                        print(f"{DIM}{preview}{RESET}")
-
-            except KeyboardInterrupt:
-                print(f"\n{DIM}(interrupted){RESET}")
-                break
-            except Exception as e:
-                err_str = str(e)
-                print(f"\n{RED}Error: {err_str}{RESET}")
-                if any(code in err_str for code in ("400", "401", "422")):
-                    # First try gentle sanitize
-                    messages = sanitize_messages(messages)
-                    # If that doesn't help, nuclear option: roll back to last user message
-                    # This removes any mid-conversation corruption
-                    while len(messages) > 1 and messages[-1]["role"] != "user":
-                        messages.pop()
-                    save_history(messages, session_file)
-                    print(f"{DIM}(rolled back to last clean state — try again){RESET}")
-                break
-        else:
-            print(f"\n{YELLOW}(stopped after {max_iters} iterations){RESET}")
-
-    save_history(messages, session_file)
+    save_history(ctx.messages, ctx.session_file)
 
 
 if __name__ == "__main__":

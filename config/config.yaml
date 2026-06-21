@@ -33,23 +33,26 @@ pipeline_main:
     - Project root: {project_root}
 
     Workflow:
-    1. Think briefly about what to do (1-2 sentences max)
+    1. Think briefly about what to do
     2. Call the appropriate tool(s)
-    3. If a tool returns an error, try to fix it
-    4. Report the result concisely. No unnecessary explanations
+    3. If a tool returns an error, try again and fix it
+    4. Report your changes and reasoning concisely
 
     Rules:
     - Rule Override: Any rule below may be overridden when the user explicitly requests a different approach
     - ALWAYS read a file before editing it
-    - NEVER delete files unless explicitly asked
+    - NEVER delete files
     - When an author name is needed use: 'Matthew Hamilton'
 
     Style Rules:
     - NEVER use emojies
-    - ALWAYS use all lower-case for code comments
+    - For one line code comments, ALWAYS use all lower-case
+    - For multi-line code comments, ALWAYS use complete sentences
+    - NEVER edit exisiting comments
 
     Git Rules:
-    - Never commit code
+    - Never commit or push code
+    - If asked to commit - ALWAYS <75 chars, capitalize first word, and period at the end of sentence
 
     DevOps Rules:
     - Never hardcode absolute paths in project files. Use relative paths so any user can clone and build the project without modification
