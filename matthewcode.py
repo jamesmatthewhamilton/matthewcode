@@ -1493,6 +1493,108 @@ def handle_input(user_input, ctx, *, interactive):
     run_agent_loop(ctx, interactive=interactive)
 
 
+# --- Terminal banner bar (configurable) ---------------------------------------
+# Up to two notifications per side; the repeated sequence fills the bar and
+# separates the notifications. Swap the LEFT/RIGHT lists to change what's shown;
+# recolour the fill and the notification chips independently.
+_TERMINAL_BAR_REPEATED_CHAR = "—"
+_TERMINAL_BAR_REPEATED_CHAR_COLOR = "RAINBOW"
+_TERMINAL_BAR_NOTIFICATIONS_COLOR = "RAINBOW"
+_TERMINAL_BAR_RAINBOW = ["91", "93", "92", "96", "94", "95"]
+
+
+def _notif_tokens(ctx):
+    """Notification: context-token usage, with a threshold colour override."""
+    if ctx.ctx_tokens <= 0:
+        return None
+    num_ctx = getattr(ctx.client, "_provider", None) and ctx.client._provider.config.get("num_ctx", 0) or 0
+    text = f"[{ctx.ctx_tokens}/{num_ctx} tokens]" if num_ctx else f"[{ctx.ctx_tokens} tokens]"
+    if ctx.ctx_tokens >= 200000:
+        return text, "5;41;30"   # blinking red bg, black text
+    if ctx.ctx_tokens >= 120000:
+        return text, "5;43;30"   # blinking yellow bg, black text
+    return text
+
+
+def _notif_session(ctx):
+    """Notification: the open session's name."""
+    return ctx.session_name or None
+
+
+_TERMINAL_BAR_LEFT = []                                 # ≤2 producers (left-to-right)
+_TERMINAL_BAR_RIGHT = [_notif_tokens, _notif_session]   # ≤2 producers
+
+
+def _terminal_width(default=80):
+    try:
+        return os.get_terminal_size().columns
+    except OSError:
+        return default
+
+
+def _colorize(text, color, counter):
+    """Colour `text` with `color` — an ANSI SGR code (e.g. "36"), or one of:
+    "RAINBOW"        — each char the next colour in _TERMINAL_BAR_RAINBOW, advancing
+                       `counter` (a 1-element list) so the cycle flows continuously
+                       across the whole bar (fill AND chips);
+    "RANDOM_RAINBOW" — (secret) each char a random colour from _TERMINAL_BAR_RAINBOW,
+                       duplicates allowed (no cycle, ignores `counter`)."""
+    if not text:
+        return ""
+    if color not in ("RAINBOW", "RANDOM_RAINBOW"):
+        return f"\033[{color}m{text}{RESET}"
+    out = []
+    for ch in text:
+        if color == "RANDOM_RAINBOW":
+            code = random.choice(_TERMINAL_BAR_RAINBOW)
+        else:
+            code = _TERMINAL_BAR_RAINBOW[counter[0] % len(_TERMINAL_BAR_RAINBOW)]
+            counter[0] += 1
+        out.append(f"\033[{code}m{ch}")
+    return "".join(out) + RESET
+
+
+def _bar_fill(n, counter):
+    """`n` chars of the repeated sequence, coloured per _TERMINAL_BAR_REPEATED_CHAR_COLOR."""
+    if n <= 0:
+        return ""
+    seq = _TERMINAL_BAR_REPEATED_CHAR
+    return _colorize((seq * (n // len(seq) + 1))[:n], _TERMINAL_BAR_REPEATED_CHAR_COLOR, counter)
+
+
+def render_terminal_bar(ctx, width):
+    """The full-width banner bar: up to two notifications per side, each separated
+    from the fill by two chars of the repeated sequence; the middle expands to fill.
+    One shared counter → RAINBOW (fill and/or chips) flows continuously across the bar."""
+    def resolve(notifs):                     # → [(chip_text, colour_override), ...]
+        chips = []
+        for n in notifs[:2]:
+            r = n(ctx)
+            if not r:
+                continue
+            text, override = r if isinstance(r, tuple) else (r, None)
+            if text:
+                chips.append((f" {text} ", override))
+        return chips
+
+    left, right = resolve(_TERMINAL_BAR_LEFT), resolve(_TERMINAL_BAR_RIGHT)
+    left_vis = sum(2 + len(t) for t, _ in left)
+    right_vis = sum(len(t) + 2 for t, _ in right)
+    middle = max(width - left_vis - right_vis, 1)
+
+    counter = [0]
+    chip = lambda t, o: _colorize(t, o or _TERMINAL_BAR_NOTIFICATIONS_COLOR, counter)
+    out = []
+    for text, override in left:              # [fill2 + Lchip] ...
+        out.append(_bar_fill(2, counter))
+        out.append(chip(text, override))
+    out.append(_bar_fill(middle, counter))
+    for text, override in right:             # ... [Rchip + fill2]
+        out.append(chip(text, override))
+        out.append(_bar_fill(2, counter))
+    return "".join(out)
+
+
 # --- Main ---
 
 
@@ -1692,45 +1794,7 @@ def main():
                       ctx_tokens=ctx_tokens)
     while True:
         try:
-            if ctx.ctx_tokens > 0:
-                num_ctx = getattr(ctx.client, '_provider', None) and ctx.client._provider.config.get("num_ctx", 0) or 0
-                if num_ctx:
-                    ctx_info = f"[{ctx.ctx_tokens}/{num_ctx} tokens]"
-                else:
-                    ctx_info = f"[{ctx.ctx_tokens} tokens]"
-            else:
-                ctx_info = ""
-            TEAL = "\033[36m"
-            TEAL_BG = "\033[46;30m"  # teal background, black text
-            try:
-                tw = os.get_terminal_size().columns
-            except OSError:
-                tw = 80
-            # Build bar: ———— [tokens] ———— [session] ——
-            right_pad = 2
-            sep = TEAL + "——" + RESET
-            parts = []
-            tokens_part = ctx_info.strip() if ctx_info.strip() else ""
-            session_part = ctx.session_name if ctx.session_name else ""
-            visible_len = right_pad
-            if tokens_part:
-                if ctx.ctx_tokens >= 200000:
-                    token_bg = "\033[5;41;30m"   # blinking red background, black text
-                elif ctx.ctx_tokens >= 120000:
-                    token_bg = "\033[5;43;30m"   # blinking yellow background, black text
-                else:
-                    token_bg = TEAL_BG
-                parts.append(token_bg + f" {tokens_part} " + RESET)
-                visible_len += len(f" {tokens_part} ") + 2  # +2 for —— separator
-            if session_part:
-                parts.append(TEAL_BG + f" {session_part} " + RESET)
-                visible_len += len(f" {session_part} ") + 2
-            dash_len = tw - visible_len
-            bar = TEAL + "—" * max(dash_len, 1) + RESET
-            for part in parts:
-                bar += sep + part
-            bar += TEAL + "—" * right_pad + RESET
-            print(bar)
+            print(render_terminal_bar(ctx, _terminal_width()))
             user_input = pt_prompt(
                 ANSI("◗ "),
                 history=pt_history,
