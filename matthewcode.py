@@ -25,6 +25,7 @@ for _slurm_path in (
 
 from llm_connections import LLMConnection, ProviderCatalog
 from res.thinking import WORDS as THINKING_WORDS
+from res.thinking import QUOTES as THINKING_QUOTES
 from res.loop_detection import LoopDetector
 from rich.console import Console
 from rich.markdown import Markdown
@@ -1381,6 +1382,10 @@ def run_agent_loop(ctx, *, interactive):
     model produces a final response or max_iters. `interactive` gates only the
     animation, output target, tool confirmation, and rendering."""
     max_iters = CONFIG.get("max_iterations", 10)
+    # Occasionally (not every turn) drop a Stoic quote right after the prompt — only
+    # interactive, so it never pollutes --prompt's stdout. Gold, 20% of the time.
+    if interactive and THINKING_QUOTES and random.random() < 0.20:
+        print(f"\n{YELLOW}{random.choice(THINKING_QUOTES)}{RESET}\n")
     detector = make_loop_detector()
     for _iter in range(max_iters):
         try:
