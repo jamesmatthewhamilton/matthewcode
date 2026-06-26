@@ -40,10 +40,3 @@ class LoopDetector:
         result_hash = hashlib.sha256(result.encode("utf-8", "replace")).hexdigest()
         payload = f"{name}\0{args_json}\0{result_hash}".encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
-
-
-LOOP_WARNING = (
-    "\n\n[LOOP DETECTED] You have called `{name}` {count} times in a row with "
-    "identical arguments and identical results. DO NOT call this tool again "
-    "with these arguments. Try a different approach, or ask the user for guidance."
-)
