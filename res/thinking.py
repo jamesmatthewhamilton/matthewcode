@@ -11,8 +11,6 @@ WORDS = [
     "ruminating",
 ]
 
-# Shown occasionally (not every turn) right after a prompt is submitted.
-# Each entry: original Greek, English translation, attribution.
 QUOTES = [
     "Ἄριστος τρόπος τοῦ ἀμύνεσθαι τὸ μὴ ἐξομοιοῦσθαι.\n"
     "“The best revenge is not to be like your enemy.”\n"

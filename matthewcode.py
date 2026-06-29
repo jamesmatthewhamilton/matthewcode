@@ -201,6 +201,7 @@ def _providers_help_text():
     return catalog.format(title="providers")
 MAX_BASH_OUTPUT = CONFIG.get("max_bash_output", 30_000)
 MAX_FILE_READ = CONFIG.get("max_file_read", 50_000)
+TRIM_TRAILING_WHITESPACE = CONFIG.get("trim_trailing_whitespace", True)
 
 
 def make_loop_detector() -> LoopDetector:
@@ -404,10 +405,23 @@ def tool_file_read(path):
         return get_prompt("pipeline_tool_errors", "file_read_error", error=e)
 
 
+def _normalize_trailing_whitespace(text):
+    """Editor-on-save normalization: strip trailing spaces/tabs from every
+    line, drop trailing blank lines, and guarantee a single final newline.
+    Empty content stays empty (don't create a lone-newline file). No-op when
+    the trim_trailing_whitespace config flag is disabled."""
+    if not TRIM_TRAILING_WHITESPACE:
+        return text
+    stripped = "\n".join(line.rstrip() for line in text.split("\n"))
+    stripped = stripped.rstrip("\n")
+    return stripped + "\n" if stripped else ""
+
+
 def tool_file_write(path, content):
     path = os.path.expanduser(path)
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        content = _normalize_trailing_whitespace(content)
         with open(path, "w") as f:
             f.write(content)
         return get_prompt("pipeline_tool_success", "file_write", path=path, len_content=len(content))
@@ -427,6 +441,7 @@ def tool_file_edit(path, old_text, new_text):
             if count > 1:
                 return get_prompt("pipeline_tool_errors", "file_edit_multiple_matches", count=count)
             new_content = content.replace(old_text, new_text, 1)
+            new_content = _normalize_trailing_whitespace(new_content)
             with open(path, "w") as f:
                 f.write(new_content)
             return get_prompt("pipeline_tool_success", "file_edit", path=path)
