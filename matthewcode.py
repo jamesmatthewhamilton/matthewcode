@@ -887,7 +887,7 @@ class ReplContext:
     """
 
     def __init__(self, *, args, console, client, messages,
-                 session_name, session_file, ctx_tokens):
+                 session_name, session_file, ctx_tokens, interactive=True):
         self.args = args
         self.console = console
         self.client = client
@@ -895,6 +895,7 @@ class ReplContext:
         self.session_name = session_name
         self.session_file = session_file
         self.ctx_tokens = ctx_tokens
+        self.interactive = interactive
         self.should_exit = False
 
 
@@ -1216,6 +1217,23 @@ def cmd_rebirth(ctx, arg):
         print(f"{RED}Rebirth failed: {e}{RESET}")
 
 
+def _prompt_command(token):
+    """Build a run() for a canned-prompt command/flag: a commonly-used prompt kept
+    in config.yaml under prompt_commands.<token> so users can edit it without code.
+    Any arg typed after the token is appended to the configured prompt. The same
+    handler serves /<token> (runs in the REPL) and --<token> (one-shot, then exits);
+    ctx.interactive decides which."""
+    def run(ctx, arg):
+        prompt = CONFIG.get("prompt_commands", {}).get(token, "")
+        if not prompt:
+            print(f"{RED}No prompt configured for '{token}' (prompt_commands.{token} in config.yaml).{RESET}")
+            return
+        if arg:
+            prompt = f"{prompt}\n\n{arg}"
+        handle_input(prompt, ctx, interactive=ctx.interactive)
+    return run
+
+
 # THE single list. Each entry has bare `flag_command` token(s); `is_command` and
 # `is_flag` decide which surfaces it appears on. /<token> and --<token> are built
 # at use-time. /help shows is_command entries; --help shows is_flag entries.
@@ -1287,6 +1305,13 @@ COMMANDS = [
             help="Run a single prompt non-interactively then exit.",
             flag_kwargs={"nargs": "?", "const": "-", "default": None, "metavar": "<prompt>"},
             is_command=False),
+    # Canned prompts (config.yaml: prompt_commands.<token>). As a flag they run
+    # once against the client and exit; as a command they run inside the REPL.
+    Command(flag_command=("qcm",),
+            help="Quick commit message generated from the current git diff.",
+            run=_prompt_command("qcm"),
+            needs_client=True,
+            one_shot=True),
 ]
 COMMAND_BY_TOKEN = {tok: c for c in COMMANDS if c.is_command for tok in c.flag_command}
 
@@ -1635,14 +1660,19 @@ def main():
     for c in COMMANDS:
         if c.is_flag:
             kwargs = dict(c.flag_kwargs)
-            if c.one_shot:                      # a one-shot flag is a boolean trigger
-                kwargs.setdefault("action", "store_true")
+            if c.one_shot:
+                # A one-shot flag takes an optional arg, mirroring `/token [arg]`:
+                # absent -> None, bare `--token` -> "", `--token foo` -> "foo".
+                kwargs.setdefault("nargs", "?")
+                kwargs.setdefault("const", "")
+                kwargs.setdefault("default", None)
+                kwargs.setdefault("metavar", "<arg>")
             parser.add_argument(*[f"--{t}" for t in c.flag_command], help=c.help, **kwargs)
     args = parser.parse_args()
 
     # Every one-shot `--flag` and --prompt is a "run once and exit" mode — they are
     # mutually exclusive. Collect all that are set and reject if more than one.
-    active = [c for c in COMMANDS if c.one_shot and getattr(args, _flag_dest(c))]
+    active = [c for c in COMMANDS if c.one_shot and getattr(args, _flag_dest(c)) is not None]
     modes = [f"--{c.flag_command[0]}" for c in active]
     if args.prompt is not None:
         modes.append("--prompt")
@@ -1661,8 +1691,9 @@ def main():
             _s_name, _s_file = None, session_path()
         _msgs = load_history(_s_file) if os.path.isfile(_s_file) else []
         _ctx = ReplContext(args=args, console=console, client=None, messages=_msgs,
-                           session_name=_s_name, session_file=_s_file, ctx_tokens=0)
-        oneshot.run(_ctx, "")
+                           session_name=_s_name, session_file=_s_file, ctx_tokens=0,
+                           interactive=False)
+        oneshot.run(_ctx, getattr(args, _flag_dest(oneshot)).strip())
         # Persist whatever the command did to the session, so ANY state-mutating
         # one-shot (clear, and future ones) saves automatically — no per-command
         # save needed. Read-only one-shots just re-write the same content (harmless).
@@ -1793,7 +1824,7 @@ def main():
         # loop — non-interactively (clean stdout, no animation), then we exit.
         ctx = ReplContext(args=args, console=console, client=client, messages=messages,
                           session_name=session_name, session_file=session_file,
-                          ctx_tokens=ctx_tokens)
+                          ctx_tokens=ctx_tokens, interactive=False)
         handle_input(user_input, ctx, interactive=False)
         save_history(ctx.messages, ctx.session_file)
         sys.exit(0)
@@ -1801,9 +1832,12 @@ def main():
     # Client one-shot flags (--diagnose / --kill-model): the model is now set up,
     # so run the command against it and exit without entering the REPL.
     if oneshot is not None:
-        oneshot.run(ReplContext(args=args, console=console, client=client,
-                                messages=messages, session_name=session_name,
-                                session_file=session_file, ctx_tokens=ctx_tokens), "")
+        _ctx = ReplContext(args=args, console=console, client=client,
+                           messages=messages, session_name=session_name,
+                           session_file=session_file, ctx_tokens=ctx_tokens,
+                           interactive=False)
+        oneshot.run(_ctx, getattr(args, _flag_dest(oneshot)).strip())
+        save_history(_ctx.messages, _ctx.session_file)
         sys.exit(0)
 
     pt_history = FileHistory(os.path.join(HISTORY_DIR, "prompt_history"))
