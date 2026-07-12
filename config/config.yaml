@@ -186,21 +186,45 @@ pipeline_tool_rejected:
 pipeline_tool_skipped:
   message: |
     Skipped: an earlier tool call in this batch was rejected by the user, so
-    this call was not run. Wait for the user's instructions before retrying.
+    this call was not run. Wait for the users instructions before retrying.
 
-# ── Canned prompts: commonly-used prompts, invoked as /<token> or --<token>.
-# Each key is a token; its value is the prompt text sent as if the user typed it.
-prompt_commands:
-  qcm: |
-    - Generate a concise commit message for the current 'git diff'
-    - Output only the commit message
-    - It must be <80 chars
-    - Do not commit yourself
-    - Start with capitalized word
-    - Talk in past tense, 'added'
-    - End sentences with period
-    - If a ticket tag is included below use it
-    - 'XXXX-1234' at beginning of ticket
-    - '(#1)' Github style tickets at end of ticket after period
-    - If no ticket is provided search the git branch to see if the ticket name or number is in the git branch
-    - If no ticket name is provided or found, output the commit message without the ticket
+# ── Aliases: canned prompts, invoked as /<token> or --<token>. Add any number;
+# each key becomes a command/flag named after it. A value is the prompt text
+# itself, or a mapping with `prompt` and an optional `help` line for /help and
+# --help. Any text typed after the token is pasted at the bottom of the prompt.
+aliases:
+  qcm:
+    help: Quick commit message generated from the current git diff.
+    prompt: |
+      - Generate a concise commit message for the current 'git diff'
+      - Output only the commit message
+      - It must be <80 chars
+      - Do not commit yourself
+      - Start with capitalized word
+      - Talk in past tense, 'added'
+      - End sentences with period
+      - If a ticket tag is included below use that ticket tag
+      - 'XXXX-1234' at beginning of ticket
+      - '(#1)' Github style tickets at end of ticket after period
+      - If no ticket is provided, search the git branch to see if the ticket name or number is in the git branch
+      - If no ticket is provided and the branch does not contain the ticket name, search the last 5 git commit messages and determine which commit is similar the current work in git diff. Use the ticket tag of the most similar commit. If non are similar output no commit tag.
+      - Output the commit message without the ticket if nothing is found
+  qd:
+    help: Quick diff summary of the current git changes.
+    prompt: |
+      - Summarize the current 'git diff' (include staged and unstaged changes)
+      - Group the summary by file, one short bullet per meaningful change
+      - Lead with a one-sentence overview of what the changes accomplish
+      - Note anything risky or incomplete (TODOs, debug prints, dead code)
+      - Do not modify any files
+      - Output only the summary
+  qr:
+    help: Quick review of the current git changes.
+    prompt: |
+      - Review the current 'git diff' (include staged and unstaged changes)
+      - Check if any of the new code can be minimized or reduced (duplication, dead branches, simpler equivalents, existing helpers it should reuse)
+      - Check if the new code could cause any issues, and list them (bugs, edge cases, regressions, performance, error handling)
+      - For each finding, name the file and line and briefly say why
+      - If nothing is found say so plainly
+      - Do not modify any files
+      - Output only the review

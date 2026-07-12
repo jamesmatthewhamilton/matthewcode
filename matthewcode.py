@@ -1217,16 +1217,25 @@ def cmd_rebirth(ctx, arg):
         print(f"{RED}Rebirth failed: {e}{RESET}")
 
 
+def _alias_spec(token):
+    """(help, prompt) for config.yaml aliases.<token>. A value is either the
+    prompt string itself, or a mapping with `prompt` and an optional `help`."""
+    spec = (CONFIG.get("aliases") or {}).get(token, "")
+    if isinstance(spec, dict):
+        return spec.get("help", ""), spec.get("prompt", "")
+    return "", spec
+
+
 def _prompt_command(token):
-    """Build a run() for a canned-prompt command/flag: a commonly-used prompt kept
-    in config.yaml under prompt_commands.<token> so users can edit it without code.
-    Any arg typed after the token is appended to the configured prompt. The same
-    handler serves /<token> (runs in the REPL) and --<token> (one-shot, then exits);
-    ctx.interactive decides which."""
+    """Build a run() for an alias command/flag: a commonly-used prompt kept in
+    config.yaml under aliases.<token> so users can edit it without code. Any text
+    typed after the token is pasted at the bottom of the configured prompt. The
+    same handler serves /<token> (runs in the REPL) and --<token> (one-shot, then
+    exits); ctx.interactive decides which."""
     def run(ctx, arg):
-        prompt = CONFIG.get("prompt_commands", {}).get(token, "")
+        _, prompt = _alias_spec(token)
         if not prompt:
-            print(f"{RED}No prompt configured for '{token}' (prompt_commands.{token} in config.yaml).{RESET}")
+            print(f"{RED}No prompt configured for '{token}' (aliases.{token} in config.yaml).{RESET}")
             return
         if arg:
             prompt = f"{prompt}\n\n{arg}"
@@ -1305,13 +1314,20 @@ COMMANDS = [
             help="Run a single prompt non-interactively then exit.",
             flag_kwargs={"nargs": "?", "const": "-", "default": None, "metavar": "<prompt>"},
             is_command=False),
-    # Canned prompts (config.yaml: prompt_commands.<token>). As a flag they run
-    # once against the client and exit; as a command they run inside the REPL.
-    Command(flag_command=("qcm",),
-            help="Quick commit message generated from the current git diff.",
-            run=_prompt_command("qcm"),
+]
+# Aliases (config.yaml: aliases.<token>): every configured alias becomes its own
+# /<token> command and --<token> one-shot flag, named after its config key — add
+# any number without touching code. As a flag it runs once against the client and
+# exits; as a command it runs inside the REPL. A token that collides with a
+# built-in command above is skipped (the built-in wins).
+COMMANDS += [
+    Command(flag_command=(token,),
+            help=_alias_spec(token)[0] or f"Run the '{token}' alias prompt from config.yaml.",
+            run=_prompt_command(token),
             needs_client=True,
-            one_shot=True),
+            one_shot=True)
+    for token in (CONFIG.get("aliases") or {})
+    if token not in {t for c in COMMANDS for t in c.flag_command}
 ]
 COMMAND_BY_TOKEN = {tok: c for c in COMMANDS if c.is_command for tok in c.flag_command}
 
