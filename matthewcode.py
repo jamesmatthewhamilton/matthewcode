@@ -3,8 +3,10 @@
 
 import argparse
 import difflib
+import fnmatch
 import json
 import os
+import re
 import subprocess
 import sys
 import random
@@ -145,8 +147,7 @@ def _resolve_slurm_sessions(yaml_path: str, provider_filter: str = None) -> str:
             ssh = sess._cluster_cfg["ssh"]
             # Fast pre-flight: 3 TCP attempts to host:22, ~6s max. Bails early
             # when VPN is down rather than sitting in connect_ssh's retry loop.
-            status_text = get_prompt("pipeline_status", "pinging_host", host=ssh['host'])
-            console.print(status_text)
+            _status("pinging_host", host=ssh['host'])
             if not can_reach(ssh["host"], port=22):
                 raise ConnectionError(
                     f"Cannot reach {ssh['host']}:22 after 3 attempts (~6s). "
@@ -156,24 +157,18 @@ def _resolve_slurm_sessions(yaml_path: str, provider_filter: str = None) -> str:
             existing = sess.peek_existing()
             if existing is not None:
                 state, job_id = existing
-                status_text = get_prompt("pipeline_status", "found_existing_job",
-                                        job_id=job_id, state=state)
-                console.print(status_text)
+                _status("found_existing_job", job_id=job_id, state=state)
             else:
-                status_text = get_prompt("pipeline_status", "no_existing_job", name=sess_name)
-                console.print(status_text)
-            status_text = get_prompt("pipeline_status", "starting_slurm", name=sess_name)
-            console.print(status_text)
+                _status("no_existing_job", name=sess_name)
+            _status("starting_slurm", name=sess_name)
             started[sess_name] = sess.start()
         handle = started[sess_name]
         provider_cfg = providers[prov_name]
         provider_cfg["base_url"] = handle.local_url
         provider_cfg.pop("slurm_session", None)
         provider_cfg.pop("ssh_tunnel", None)  # remove any stale tunnel block
-        status_text = get_prompt("pipeline_status", "provider_ready",
-                                provider=prov_name, url=handle.local_url,
-                                job_id=handle.job_id, gpu=handle.gpu_info)
-        console.print(status_text)
+        _status("provider_ready", provider=prov_name, url=handle.local_url,
+                job_id=handle.job_id, gpu=handle.gpu_info)
 
     tf = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
     _yaml.safe_dump(cfg, tf)
@@ -226,6 +221,11 @@ def get_prompt(pipeline: str, prompt_type: str, **extra_vars) -> str:
         raise ValueError(f"Missing prompt: {pipeline}.{prompt_type} not found in config.yaml")
     all_vars = {**PROMPT_VARS, **extra_vars}
     return template.format(**all_vars)
+
+
+def _status(key, **extra_vars):
+    """Print a pipeline_status message from config."""
+    console.print(get_prompt("pipeline_status", key, **extra_vars))
 
 
 SYSTEM_PROMPT = get_prompt("pipeline_main", "system_prompt")
@@ -362,10 +362,12 @@ TOOLS = [
 
 SAFE_TOOLS = {"file_read", "dir_list", "file_find", "file_grep", "find_build_env"}
 
+# directories the walking tools (file_find, file_grep, find_build_env) never enter
+PRUNE_DIRS = ("node_modules", "__pycache__", ".git", "venv", "env")
+
 
 def is_protected_path(path: str, protected: list) -> bool:
     """Check if a path matches any protected path pattern."""
-    import fnmatch
     path = os.path.expanduser(path)
     for pattern in protected:
         pattern = os.path.expanduser(pattern)
@@ -379,7 +381,6 @@ def is_restricted_bash(name: str, args: dict) -> bool:
     y/N prompt even when --yes / auto_approve is set."""
     if name != "bash_run":
         return False
-    import re
     cmd = args.get("command", "")
     for word in CONFIG.get("restricted_bash_commands", []):
         if re.search(rf"\b{re.escape(word)}\b", cmd):
@@ -513,14 +514,12 @@ def tool_dir_list(path):
 
 
 def tool_file_find(pattern, path="."):
-    import fnmatch
     path = os.path.expanduser(path or ".")
     if not os.path.isdir(path):
         return get_prompt("pipeline_tool_errors", "directory_not_found", path=path)
     matches = []
     for root, dirs, files in os.walk(path):
-        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in
-                   ("node_modules", "__pycache__", ".git", "venv", "env")]
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in PRUNE_DIRS]
         for f in files:
             if fnmatch.fnmatch(f, pattern):
                 matches.append(os.path.join(root, f))
@@ -530,7 +529,6 @@ def tool_file_find(pattern, path="."):
 
 
 def tool_file_grep(pattern, path=".", file_glob=None):
-    import fnmatch, re
     path = os.path.expanduser(path or ".")
     try:
         regex = re.compile(pattern)
@@ -540,8 +538,7 @@ def tool_file_grep(pattern, path=".", file_glob=None):
     files_to_search = [path] if os.path.isfile(path) else []
     if not files_to_search:
         for root, dirs, files in os.walk(path):
-            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in
-                       ("node_modules", "__pycache__", ".git", "venv", "env")]
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in PRUNE_DIRS]
             for f in files:
                 if file_glob and not fnmatch.fnmatch(f, file_glob):
                     continue
@@ -561,7 +558,6 @@ def tool_file_grep(pattern, path=".", file_glob=None):
 
 def tool_find_build_env(path="."):
     """Find build environments: conda, Docker, build systems, CI/CD configs."""
-    import fnmatch
     path = os.path.expanduser(path or ".")
 
     # Priority 1: Build environments (what you should use to build)
@@ -592,8 +588,7 @@ def tool_find_build_env(path="."):
         if depth >= 3:
             dirs.clear()
             continue
-        dirs[:] = [d for d in dirs if d not in
-                   ("node_modules", "__pycache__", "venv", "env", ".git")]
+        dirs[:] = [d for d in dirs if d not in PRUNE_DIRS]
         for f in files:
             fpath = os.path.join(root, f)
             for pattern in env_patterns:
@@ -684,6 +679,17 @@ TOOL_DISPATCH = {
 # --- Confirmation ---
 
 
+def _ask_yes_no(prompt, default_yes=True):
+    """y/N-style confirmation with the EOF/Ctrl-C-means-No guard. default_yes
+    controls whether a bare Enter accepts ([Y/n]) or declines ([y/N])."""
+    accepted = ("", "y", "yes") if default_yes else ("y", "yes")
+    try:
+        return input(f"{BOLD}{prompt}{RESET}").strip().lower() in accepted
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+
 def confirm_tool(name, args, restricted=False):
     if name == "file_write":
         path = args.get("path", "?")
@@ -711,23 +717,14 @@ def confirm_tool(name, args, restricted=False):
         print(f"\n{YELLOW}Run: {args.get('command', '?')}{RESET}")
     if restricted:
         print(f"{RED}Restricted command — approval required even with --yes.{RESET}")
-        try:
-            return input(f"{BOLD}Run anyway? [y/N] {RESET}").strip().lower() in ("y", "yes")
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return False
-    try:
-        return input(f"{BOLD}Allow? [Y/n] {RESET}").strip().lower() in ("", "y", "yes")
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return False
+        return _ask_yes_no("Run anyway? [y/N] ", default_yes=False)
+    return _ask_yes_no("Allow? [Y/n] ")
 
 
 # --- Fallback tool call parser ---
 
 
 def parse_tool_calls_from_text(text):
-    import re
     calls = []
     clean = re.sub(r'```(?:json)?\s*', '', text)
     i = 0
@@ -1012,13 +1009,17 @@ def cmd_history(ctx, arg):
         ctx.console.print(_panel(i, msg))
 
 
+def _provider_base_url(ctx):
+    """base_url of the active provider's connection, or None."""
+    cur = LLMConnection._registry.get(ctx.args.provider)
+    return getattr(getattr(cur, "_provider", None), "base_url", None)
+
+
 def cmd_diagnose(ctx, arg):
-    import time as _time
     import urllib.error as _urlerr
     import urllib.request as _urlreq
 
-    cur = LLMConnection._registry.get(ctx.args.provider)
-    base_url = getattr(getattr(cur, "_provider", None), "base_url", None)
+    base_url = _provider_base_url(ctx)
     print(f"{DIM}── /diagnose {ctx.args.provider} ──{RESET}")
     print(f"  base_url: {base_url or '(none)'}")
 
@@ -1026,15 +1027,15 @@ def cmd_diagnose(ctx, arg):
         if not base_url:
             return ("?", 0.0, "no base_url")
         url = base_url.rstrip("/") + path
-        t0 = _time.time()
+        t0 = time.time()
         try:
             with _urlreq.urlopen(url, timeout=timeout) as r:
                 body = r.read().decode("utf-8", errors="replace")
-                return (r.status, _time.time() - t0, body[:500])
+                return (r.status, time.time() - t0, body[:500])
         except _urlerr.HTTPError as e:
-            return (e.code, _time.time() - t0, str(e))
+            return (e.code, time.time() - t0, str(e))
         except Exception as e:
-            return ("ERR", _time.time() - t0, f"{type(e).__name__}: {e}")
+            return ("ERR", time.time() - t0, f"{type(e).__name__}: {e}")
 
     for path in ("/api/tags", "/api/ps"):
         code, dt, body = _probe(path)
@@ -1058,8 +1059,7 @@ def cmd_diagnose(ctx, arg):
 
 
 def cmd_kill_model(ctx, arg):
-    cur = LLMConnection._registry.get(ctx.args.provider)
-    base_url = getattr(getattr(cur, "_provider", None), "base_url", None)
+    base_url = _provider_base_url(ctx)
     killed_what = None
 
     from llm_connections import SlurmSession
@@ -1093,13 +1093,8 @@ def cmd_name(ctx, arg):
     new_name = arg.strip()
     new_file = session_path(new_name)
     if os.path.isfile(new_file) and new_name != ctx.session_name:
-        try:
-            answer = input(f"{YELLOW}Session '{new_name}' exists. Overwrite? [y/N] {RESET}").strip().lower()
-            if answer not in ("y", "yes"):
-                print(f"{DIM}Cancelled.{RESET}")
-                return
-        except (EOFError, KeyboardInterrupt):
-            print()
+        if not _ask_yes_no(f"{YELLOW}Session '{new_name}' exists. Overwrite? [y/N] ", default_yes=False):
+            print(f"{DIM}Cancelled.{RESET}")
             return
     ctx.session_name = new_name
     ctx.session_file = new_file
@@ -1155,16 +1150,11 @@ def cmd_rebirth(ctx, arg):
     if len(ctx.messages) <= 2:
         print(f"{DIM}Nothing to compress.{RESET}")
         return
-    RED_LINE = "\033[31m"
     RED_BG = "\033[41;30m"
-    try:
-        tw_r = os.get_terminal_size().columns
-    except OSError:
-        tw_r = 80
     rebirth_text = " Now I must destroy myself to be born again anew... 🧎 "
     visible_len = len(rebirth_text) + 1   # emoji takes 2 columns
-    dash_len = tw_r - visible_len
-    print(RED_BG + rebirth_text + RESET + RED_LINE + "—" * max(dash_len, 0) + RESET)
+    dash_len = _terminal_width() - visible_len
+    print(RED_BG + rebirth_text + RESET + RED + "—" * max(dash_len, 0) + RESET)
     try:
         rebirth_prompt = get_prompt("pipeline_rebirth", "user_prompt")
         ctx.messages.append({"role": "user", "content": rebirth_prompt})
@@ -1248,7 +1238,7 @@ def _prompt_command(token):
 # at use-time. /help shows is_command entries; --help shows is_flag entries.
 COMMANDS = [
     Command(flag_command=("help",),
-            help="",
+            help="Show this help.",
             run=cmd_help,
             is_flag=False),                 # --help is argparse's builtin
     Command(flag_command=("exit", "quit"),
@@ -1544,11 +1534,49 @@ def run_agent_loop(ctx, *, interactive):
             print(f"(stopped after {max_iters} iterations)", file=sys.stderr)
 
 
+SNIPPET_RE = re.compile(r"\{\{(\w+)\}\}")
+
+
+def expand_snippets(text):
+    """Replace each {{name}} in a prompt with config.yaml snippets.<name>, so
+    shared fragments (e.g. commit rules) are written once and reused inline by
+    any alias or typed prompt. Unknown names are left untouched."""
+    snippets = CONFIG.get("snippets") or {}
+    return SNIPPET_RE.sub(
+        lambda m: str(snippets.get(m.group(1), m.group(0))).rstrip("\n"), text)
+
+
+INLINE_CMD_RE = re.compile(r"!`([^`\n]+)`")
+
+
+def expand_inline_commands(text, *, interactive):
+    """Claude Code-style dynamic context injection: replace each !`command` in a
+    prompt with the command's output before it is sent to the model. Runs for
+    every prompt source (REPL, --prompt, aliases). Restricted commands follow the
+    restricted_bash_commands rule: y/N confirm when interactive, skipped when not."""
+    def _expand(match):
+        cmd = match.group(1)
+        if is_restricted_bash("bash_run", {"command": cmd}):
+            if not interactive or not confirm_tool("bash_run", {"command": cmd}, restricted=True):
+                return f"[skipped restricted command: {cmd}]"
+        out = tool_bash_run(cmd)
+        out = re.sub(r"\n?\[exit code: 0\]$", "", out)   # success marker is noise in a prompt
+        out = out.rstrip("\n")   # trailing-newline strip, same as $(...) substitution
+        if out == "(no output, exit 0 — command succeeded)":
+            out = "(empty)"   # unambiguous for prompt rules that branch on empty output
+        if interactive:
+            print(f"{DIM}!`{cmd}` → {len(out)} chars{RESET}")
+        return out
+    return INLINE_CMD_RE.sub(_expand, text)
+
+
 def handle_input(user_input, ctx, *, interactive):
     """Process one line of input: dispatch a /command, or run an agent turn. The
     one path shared by the interactive REPL and the one-shot --prompt mode."""
     if try_dispatch_command(user_input, ctx):
         return
+    user_input = expand_snippets(user_input)   # before commands: snippets may embed !`cmd`
+    user_input = expand_inline_commands(user_input, interactive=interactive)
     ctx.messages.append({"role": "user",
                          "content": get_prompt("pipeline_main", "user_prompt", user_input=user_input)})
     run_agent_loop(ctx, interactive=interactive)
@@ -1564,11 +1592,16 @@ _TERMINAL_BAR_NOTIFICATIONS_COLOR = "RAINBOW"
 _TERMINAL_BAR_RAINBOW = ["91", "93", "92", "96", "94", "95"]
 
 
+def _num_ctx(client):
+    """The provider's configured num_ctx, or 0 when unknown."""
+    return getattr(client, "_provider", None) and client._provider.config.get("num_ctx", 0) or 0
+
+
 def _notif_tokens(ctx):
     """Notification: context-token usage, with a threshold colour override."""
     if ctx.ctx_tokens <= 0:
         return None
-    num_ctx = getattr(ctx.client, "_provider", None) and ctx.client._provider.config.get("num_ctx", 0) or 0
+    num_ctx = _num_ctx(ctx.client)
     text = f"[{ctx.ctx_tokens}/{num_ctx} tokens]" if num_ctx else f"[{ctx.ctx_tokens} tokens]"
     if ctx.ctx_tokens >= 200000:
         return text, "5;41;30"   # blinking red bg, black text
@@ -1761,7 +1794,7 @@ def main():
     else:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    num_ctx = getattr(client, '_provider', None) and client._provider.config.get("num_ctx", 0) or 0
+    num_ctx = _num_ctx(client)
     # Estimate tokens from loaded messages (~4 chars per token is a rough average)
     total_chars = sum(len(str(m.get("content", ""))) for m in messages)
     ctx_tokens = total_chars // 4

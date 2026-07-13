@@ -53,8 +53,9 @@ pipeline_main:
     - NEVER edit existing comments
 
     Git Rules:
-    - Never commit or push code
-    - If asked to commit - ALWAYS <75 chars, capitalize first word, and period at the end of sentence
+    - NEVER push code
+    - Never commit unless the user explicitly asks for a commit
+    - If asked to commit - ALWAYS <80 chars, capitalize first word, and period at the end of sentence
 
     DevOps Rules:
     - Never hardcode absolute paths in project files. Use relative paths so any user can clone and build the project without modification
@@ -188,43 +189,102 @@ pipeline_tool_skipped:
     Skipped: an earlier tool call in this batch was rejected by the user, so
     this call was not run. Wait for the users instructions before retrying.
 
+# ── Snippets: shared prompt fragments. Reference one anywhere in any prompt
+# (typed or aliased) with {{name}}; it is replaced by the snippet text before
+# the prompt is sent. Unknown {{names}} are left untouched.
+snippets:
+  commit_rules: |
+    - It must be <80 chars
+    - Start with capitalized word
+    - Talk in past tense, 'added'
+    - End sentences with period
+    - If a ticket tag is included below use that ticket tag
+    - Do not put a period after the ticket
+    - 'XXXX-1234' at beginning of ticket
+    - '(#1)' Github style tickets at end of ticket after period
+    - If no ticket is provided, check the branch name below for the ticket name or number
+    - If no ticket is provided and the branch does not contain the ticket name, determine which of the last 5 commits below is most similar to the work being committed. Copy ONLY the ticket tag (e.g. '(#25)') from that commit — NEVER copy any commit message text. If none are similar output no commit tag.
+    - The commit message must describe the changes in your own words and must not be identical to any previous commit message
+
 # ── Aliases: canned prompts, invoked as /<token> or --<token>. Add any number;
 # each key becomes a command/flag named after it. A value is the prompt text
 # itself, or a mapping with `prompt` and an optional `help` line for /help and
 # --help. Any text typed after the token is pasted at the bottom of the prompt.
+# Any prompt (typed or aliased) may embed !`command` — the command runs before
+# the prompt is sent and its output is inlined in place of the token.
 aliases:
   qcm:
     help: Quick commit message generated from the current git diff.
     prompt: |
-      - Generate a concise commit message for the current 'git diff'
+      - Generate a concise commit message for the staged diff below
+      - If the staged diff is (empty) use the unstaged diff instead
       - Output only the commit message
-      - It must be <80 chars
       - Do not commit yourself
-      - Start with capitalized word
-      - Talk in past tense, 'added'
-      - End sentences with period
-      - If a ticket tag is included below use that ticket tag
-      - 'XXXX-1234' at beginning of ticket
-      - '(#1)' Github style tickets at end of ticket after period
-      - If no ticket is provided, search the git branch to see if the ticket name or number is in the git branch
-      - If no ticket is provided and the branch does not contain the ticket name, search the last 5 git commit messages and determine which commit is similar the current work in git diff. Use the ticket tag of the most similar commit. If non are similar output no commit tag.
+      {{commit_rules}}
       - Output the commit message without the ticket if nothing is found
+
+      Staged diff:
+      !`git diff --staged`
+
+      Unstaged diff:
+      !`git diff`
+
+      Branch: !`git branch --show-current`
+
+      Last 5 commits (for ticket-tag lookup only, do not copy):
+      !`git log --oneline -5`
+  qacm:
+    help: Quick architect commit message. Splits current work into 1-3 commits and commits them.
+    prompt: |
+      - The user is explicitly asking you to commit: divide the work below into 1-3 logical commits and CREATE them with git commands
+      - Step 1: state your commit plan — for each group, the whole files it contains and its commit message
+      - Step 2: in the SAME turn, immediately execute the plan with tool calls: 'git add <files>' then 'git commit -m "<message>"' for each group — never 'git add .' or '-A'
+      - Do not stop after stating the plan and do not ask for approval — running this command IS the user's approval. You are done only when the commits exist
+      - Work forward only: NEVER use 'git reset HEAD~', 'git commit --amend', or undo a commit. If a commit was imperfect, leave it and continue
+      - If anything is already staged before the first commit, run 'git reset' once to unstage it (this keeps all changes in the working tree)
+      - A single files changes cannot be split across commits
+      - Prefer fewer commits; only split when changes are clearly unrelated
+      - NEVER push
+      - 'git add' succeeding with no output is normal — the add worked; never repeat a command that already succeeded
+      - After each commit run 'git status --short'; when it lists no modified files STOP: show 'git log --oneline -3' and briefly state what went into each commit
+      - Each commit message must follow these rules:
+      {{commit_rules}}
+
+      Status (snapshot from before you started):
+      !`git status --short`
+
+      Diff (staged and unstaged — also a snapshot from before you started; once you begin committing, trust 'git status' over this and never re-add a file it no longer lists):
+      !`git diff HEAD`
+
+      Branch: !`git branch --show-current`
+
+      Last 5 commits (for ticket-tag lookup only, do not copy):
+      !`git log --oneline -5`
   qd:
     help: Quick diff summary of the current git changes.
     prompt: |
-      - Summarize the current 'git diff' (include staged and unstaged changes)
+      - Summarize the git diff below (staged and unstaged changes)
       - Group the summary by file, one short bullet per meaningful change
       - Lead with a one-sentence overview of what the changes accomplish
       - Note anything risky or incomplete (TODOs, debug prints, dead code)
       - Do not modify any files
       - Output only the summary
+
+      Status:
+      !`git status --short`
+
+      Diff:
+      !`git diff HEAD`
   qr:
     help: Quick review of the current git changes.
     prompt: |
-      - Review the current 'git diff' (include staged and unstaged changes)
+      - Review the git diff below (staged and unstaged changes)
       - Check if any of the new code can be minimized or reduced (duplication, dead branches, simpler equivalents, existing helpers it should reuse)
       - Check if the new code could cause any issues, and list them (bugs, edge cases, regressions, performance, error handling)
       - For each finding, name the file and line and briefly say why
       - If nothing is found say so plainly
       - Do not modify any files
       - Output only the review
+
+      Diff:
+      !`git diff HEAD`
