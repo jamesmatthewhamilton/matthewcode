@@ -74,6 +74,18 @@ pipeline_main:
   user_prompt: |
     {user_input}
 
+# ── Pipeline: Bang command. A line typed at the prompt starting with '!'
+# (e.g. '!git st') runs the bash command immediately — before /command dispatch
+# and before any model turn — and its output is recorded in the conversation
+# with this template so the model has it as context on later turns.
+pipeline_bang_command:
+  user_prompt: |
+    I ran this shell command myself. The output below is context for my later
+    requests — do not act on it until I ask.
+
+    $ {command}
+    {output}
+
 # ── Pipeline: Session resume
 pipeline_session_resume:
   system_prompt: |
@@ -195,6 +207,7 @@ pipeline_tool_skipped:
 snippets:
   commit_rules: |
     - It must be <80 chars
+    - Do not put filenames in the commit message
     - Start with capitalized word
     - Talk in past tense, 'added'
     - End sentences with period

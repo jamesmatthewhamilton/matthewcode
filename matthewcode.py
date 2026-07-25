@@ -1549,30 +1549,62 @@ def expand_snippets(text):
 INLINE_CMD_RE = re.compile(r"!`([^`\n]+)`")
 
 
+def run_prompt_command(cmd, *, interactive):
+    """Run one prompt-embedded bash command — the single executor behind both
+    !`command` inline injection and a !command line typed at the prompt.
+    Restricted commands follow the restricted_bash_commands rule: y/N confirm
+    when interactive, skipped when not. Returns the cleaned output."""
+    if is_restricted_bash("bash_run", {"command": cmd}):
+        if not interactive or not confirm_tool("bash_run", {"command": cmd}, restricted=True):
+            return f"[skipped restricted command: {cmd}]"
+    out = tool_bash_run(cmd)
+    out = re.sub(r"\n?\[exit code: 0\]$", "", out)   # success marker is noise in a prompt
+    out = out.rstrip("\n")   # trailing-newline strip, same as $(...) substitution
+    if out == "(no output, exit 0 — command succeeded)":
+        out = "(empty)"   # unambiguous for prompt rules that branch on empty output
+    return out
+
+
 def expand_inline_commands(text, *, interactive):
     """Claude Code-style dynamic context injection: replace each !`command` in a
     prompt with the command's output before it is sent to the model. Runs for
-    every prompt source (REPL, --prompt, aliases). Restricted commands follow the
-    restricted_bash_commands rule: y/N confirm when interactive, skipped when not."""
+    every prompt source (REPL, --prompt, aliases)."""
     def _expand(match):
         cmd = match.group(1)
-        if is_restricted_bash("bash_run", {"command": cmd}):
-            if not interactive or not confirm_tool("bash_run", {"command": cmd}, restricted=True):
-                return f"[skipped restricted command: {cmd}]"
-        out = tool_bash_run(cmd)
-        out = re.sub(r"\n?\[exit code: 0\]$", "", out)   # success marker is noise in a prompt
-        out = out.rstrip("\n")   # trailing-newline strip, same as $(...) substitution
-        if out == "(no output, exit 0 — command succeeded)":
-            out = "(empty)"   # unambiguous for prompt rules that branch on empty output
+        out = run_prompt_command(cmd, interactive=interactive)
         if interactive:
             print(f"{DIM}!`{cmd}` → {len(out)} chars{RESET}")
         return out
     return INLINE_CMD_RE.sub(_expand, text)
 
 
+def try_run_bang_command(user_input, ctx, *, interactive):
+    """If `user_input` is a !command line (e.g. '!git st'), run it immediately
+    and return True; otherwise return False. Checked before /command dispatch
+    and before any model turn, so a typed bash command always wins. The output
+    is shown to the user and recorded in the conversation as context for later
+    turns — no model call is made. A line starting with !` falls through so the
+    inline !`command` injection form keeps working as a prompt."""
+    if not user_input.startswith("!") or user_input.startswith("!`"):
+        return False
+    cmd = user_input[1:].strip()
+    if not cmd:
+        return False
+    out = run_prompt_command(cmd, interactive=interactive)
+    print(out)
+    ctx.messages.append({"role": "user",
+                         "content": get_prompt("pipeline_bang_command", "user_prompt",
+                                               command=cmd, output=out)})
+    save_history(ctx.messages, ctx.session_file)
+    return True
+
+
 def handle_input(user_input, ctx, *, interactive):
-    """Process one line of input: dispatch a /command, or run an agent turn. The
-    one path shared by the interactive REPL and the one-shot --prompt mode."""
+    """Process one line of input: run a !command, dispatch a /command, or run an
+    agent turn. The one path shared by the interactive REPL and the one-shot
+    --prompt mode."""
+    if try_run_bang_command(user_input, ctx, interactive=interactive):
+        return
     if try_dispatch_command(user_input, ctx):
         return
     user_input = expand_snippets(user_input)   # before commands: snippets may embed !`cmd`
