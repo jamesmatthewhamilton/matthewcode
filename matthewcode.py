@@ -230,6 +230,28 @@ def _status(key, **extra_vars):
 
 SYSTEM_PROMPT = get_prompt("pipeline_main", "system_prompt")
 
+PIPELINE_PLAN = "pipeline_plan"
+PIPELINE_NEXT = "pipeline_next"
+UNNAMED_SESSION_LABEL = "default"
+UNCHECKED_STEP_RE = re.compile(r"^[ \t]*[-*] \[ \]", re.M)
+
+
+def plan_file(ctx):
+    """Path of this session's checkbox plan: TODO_<session>.md in the working
+    directory. Computed at call time from ctx.session_name so it follows
+    /session-rename and /session switches automatically."""
+    name = ctx.session_name or UNNAMED_SESSION_LABEL
+    return os.path.join(os.getcwd(), f"TODO_{name}.md")
+
+
+def session_vars(ctx):
+    """Dynamic per-session prompt variables: usable as {{name}} in any prompt
+    (via expand_snippets) and as {name} format vars in pipeline templates."""
+    return {
+        "session_name": ctx.session_name or UNNAMED_SESSION_LABEL,
+        "plan_file": plan_file(ctx),
+    }
+
 # --- Tool definitions ---
 
 TOOLS = [
@@ -1216,6 +1238,15 @@ def _alias_spec(token):
     return "", spec
 
 
+def _dispatch_prompt(ctx, prompt, arg=""):
+    """Shared tail of every config-backed prompt command (aliases AND pipeline
+    commands like /plan, /next): paste the typed arg at the bottom of the
+    configured prompt, then run it through the one shared input path."""
+    if arg:
+        prompt = f"{prompt}\n\n{arg}"
+    handle_input(prompt, ctx, interactive=ctx.interactive)
+
+
 def _prompt_command(token):
     """Build a run() for an alias command/flag: a commonly-used prompt kept in
     config.yaml under aliases.<token> so users can edit it without code. Any text
@@ -1227,10 +1258,41 @@ def _prompt_command(token):
         if not prompt:
             print(f"{RED}No prompt configured for '{token}' (aliases.{token} in config.yaml).{RESET}")
             return
-        if arg:
-            prompt = f"{prompt}\n\n{arg}"
-        handle_input(prompt, ctx, interactive=ctx.interactive)
+        _dispatch_prompt(ctx, prompt, arg)
     return run
+
+
+def cmd_plan(ctx, arg):
+    """/plan — no arg shows the session's plan file (pure file read, no model
+    call, matching the /session and /provider convention); /plan <description>
+    asks the model to create or revise the checkbox plan."""
+    path = plan_file(ctx)
+    if not arg:
+        if os.path.isfile(path):
+            with open(path, "r") as f:
+                render_markdown(f.read())
+        else:
+            print(f"{DIM}No plan file at {path}. Usage: /plan <description>{RESET}")
+        return
+    prompt = get_prompt(PIPELINE_PLAN, "user_prompt", **session_vars(ctx))
+    _dispatch_prompt(ctx, prompt, arg)
+
+
+def cmd_next(ctx, arg):
+    """/next — execute the first unchecked step of the session's plan. Missing
+    file and all-steps-checked are detected locally so no model turn is spent
+    on a no-op; any typed arg is passed along as extra guidance for the step."""
+    path = plan_file(ctx)
+    if not os.path.isfile(path):
+        print(f"{DIM}No plan file at {path}. Create one with /plan <description>.{RESET}")
+        return
+    with open(path, "r") as f:
+        content = f.read()
+    if not UNCHECKED_STEP_RE.search(content):
+        print(f"{DIM}All steps in {path} are complete.{RESET}")
+        return
+    prompt = get_prompt(PIPELINE_NEXT, "user_prompt", **session_vars(ctx))
+    _dispatch_prompt(ctx, prompt, arg)
 
 
 # THE single list. Each entry has bare `flag_command` token(s); `is_command` and
@@ -1257,6 +1319,18 @@ COMMANDS = [
             help="Ask the LLM to summarize the session. Delete all conversation history and replace with the summary.",
             run=cmd_rebirth,
             is_flag=False),
+    Command(flag_command=("plan",),
+            help="Show the session's plan (TODO_<session>.md). With <arg>, create or revise it as a checkbox to-do list.",
+            run=cmd_plan,
+            arghint="[<description>]",
+            needs_client=True,
+            one_shot=True),
+    Command(flag_command=("next",),
+            help="Execute the first unchecked step of the session's plan, mark it done, then stop.",
+            run=cmd_next,
+            arghint="[<guidance>]",
+            needs_client=True,
+            one_shot=True),
     Command(flag_command=("session",),
             help="Switch to session <arg>. If none exists, create new session named <arg>.",
             run=cmd_session,
@@ -1537,11 +1611,16 @@ def run_agent_loop(ctx, *, interactive):
 SNIPPET_RE = re.compile(r"\{\{(\w+)\}\}")
 
 
-def expand_snippets(text):
+def expand_snippets(text, ctx=None):
     """Replace each {{name}} in a prompt with config.yaml snippets.<name>, so
     shared fragments (e.g. commit rules) are written once and reused inline by
-    any alias or typed prompt. Unknown names are left untouched."""
-    snippets = CONFIG.get("snippets") or {}
+    any alias or typed prompt. When a ctx is given, the dynamic session_vars
+    built-ins (session_name, plan_file) are also available — those names are
+    reserved and win over same-named config snippets. Unknown names are left
+    untouched."""
+    snippets = dict(CONFIG.get("snippets") or {})
+    if ctx is not None:
+        snippets.update(session_vars(ctx))
     return SNIPPET_RE.sub(
         lambda m: str(snippets.get(m.group(1), m.group(0))).rstrip("\n"), text)
 
@@ -1607,10 +1686,11 @@ def handle_input(user_input, ctx, *, interactive):
         return
     if try_dispatch_command(user_input, ctx):
         return
-    user_input = expand_snippets(user_input)   # before commands: snippets may embed !`cmd`
+    user_input = expand_snippets(user_input, ctx)   # before commands: snippets may embed !`cmd`
     user_input = expand_inline_commands(user_input, interactive=interactive)
     ctx.messages.append({"role": "user",
-                         "content": get_prompt("pipeline_main", "user_prompt", user_input=user_input)})
+                         "content": get_prompt("pipeline_main", "user_prompt",
+                                               user_input=user_input, **session_vars(ctx))})
     run_agent_loop(ctx, interactive=interactive)
 
 

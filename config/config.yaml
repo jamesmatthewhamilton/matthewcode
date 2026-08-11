@@ -1,14 +1,25 @@
+# ==============================================================================
+# MatthewCode CLI Configuration
+# ==============================================================================
+# Description: All-in-one quick-edit config for MatthewCode CLI
+# Maintainer:  James Matthew Hamilton
+# Updated:     2026
+#
+# Notes:
+#   - Model is configured in ~/.llm-configuration/config
+#   - Variables start with 'variable_*'
+#   - Aliases start with 'aliases_*'
+#   - Pipeline prompts start with 'pipeline_*'
+#   - Mode prompts start with 'mode_*'
+# ==============================================================================
+
 auto_approve: false
 max_iterations: 100
 max_bash_output: 30000
 max_file_read: 50000
-# Editor-on-save normalization for file_write/file_edit: strip per-line
-# trailing whitespace, drop trailing blank lines, ensure one final newline.
 trim_trailing_whitespace: true
 verbose: false
 
-# bash commands containing any of these words always require y/N approval,
-# even when --yes / auto_approve is set.
 restricted_bash_commands:
   - rm
   - curl
@@ -19,11 +30,10 @@ loop_detection:
 
 rules:
   protected_paths:
-    - ~/.*           # all hidden dirs/files (ssh, aws, gnupg, etc.)
-    - /etc/          # system config
-    - /private/      # macOS system files
+    - ~/.*
+    - /etc/
+    - /private/
 
-# ── Pipeline: Main conversation
 pipeline_main:
   system_prompt: |
     You are MatthewCode, a coding assistant with access to tools.
@@ -74,10 +84,6 @@ pipeline_main:
   user_prompt: |
     {user_input}
 
-# ── Pipeline: Bang command. A line typed at the prompt starting with '!'
-# (e.g. '!git st') runs the bash command immediately — before /command dispatch
-# and before any model turn — and its output is recorded in the conversation
-# with this template so the model has it as context on later turns.
 pipeline_bang_command:
   user_prompt: |
     I ran this shell command myself. The output below is context for my later
@@ -86,13 +92,44 @@ pipeline_bang_command:
     $ {command}
     {output}
 
-# ── Pipeline: Session resume
+pipeline_plan:
+  user_prompt: |
+    Create or revise the plan file for this session: {plan_file}
+
+    Plan file rules:
+    - It is a markdown checkbox to-do list. Every actionable step is one line: "- [ ] <step-description>"
+    - Steps must be small, concrete, and independently executable - one sitting of work each
+    - Order steps so each builds only on the ones above it
+    - Start the file with a single title line: "# Plan: {session_name}", optionally followed by a short context paragraph; everything else is checkbox lines
+    - If the file already exists (current contents below), REVISE it: keep every checked "- [x]" line exactly as-is and in place; only add, remove, or reword unchecked "- [ ]" lines
+    - Write the file with file_write (new plan) or file_edit (revision). Do NOT execute any plan steps now
+    - After writing, show the user the final checklist and stop
+
+    Current contents of {plan_file}:
+    !`cat "{plan_file}" 2>/dev/null || echo "(no plan yet)"`
+
+    Plan description from the user:
+
+pipeline_next:
+  user_prompt: |
+    Execute exactly ONE step from the plan file {plan_file}.
+
+    Rules:
+    - The plan's current contents are below. Find the FIRST unchecked line "- [ ]"
+    - Execute only that one step, using your tools
+    - When the step is done, mark it complete: use file_edit on {plan_file} to change exactly that line's "- [ ]" to "- [x]" and nothing else
+    - Then briefly report what you did and STOP. Do NOT start the next step, even if it looks trivial
+    - If the step fails, leave it unchecked, report the failure, and stop
+    - If every line is already checked, say the plan is complete and stop
+
+    Current contents of {plan_file}:
+    !`cat "{plan_file}" 2>/dev/null || echo "(no plan file)"`
+
 pipeline_session_resume:
   system_prompt: |
     The user has returned to this session. Wait for their next message.
     Do not continue any previous task unless they explicitly ask you to.
 
-# ── Pipeline: Rebirth (context compression)
 pipeline_rebirth:
   num_messages_kept: 4
   system_prompt: |
@@ -108,7 +145,6 @@ pipeline_rebirth:
     Summarize this conversation organized by project. For each project
     directory that was worked on, write a text section with this format:
 
-    ## {project_root}
     Summary: Brief description of the project and what was accomplished.
     Build: Step-by-step commands to build this project from scratch. If not yet determined, write "Not yet determined."
     Decisions: Key decisions, preferences, or constraints the user stated.
@@ -127,13 +163,11 @@ pipeline_rebirth:
 
     Output ONLY the summary, no preamble.
 
-# ── Pipeline: Loop detected
 pipeline_loop_detected:
   message: |
 
     [LOOP DETECTED] You have called `{name}` {count} times in a row with identical arguments and identical results. DO NOT call this tool again with these arguments. Try a different approach, or ask the user for guidance.
 
-# ── Pipeline: Tool error messages
 pipeline_tool_errors:
   file_not_found: |
     Error: File not found: {path}
@@ -160,7 +194,6 @@ pipeline_tool_errors:
   unknown_tool: |
     Error: Unknown tool '{name}'
 
-# ── Pipeline: Tool success messages
 pipeline_tool_success:
   file_write: |
     Wrote {len_content} chars to {path}
@@ -171,7 +204,6 @@ pipeline_tool_success:
   find_no_matches: |
     No files matching '{pattern}' found in {path}
 
-# ── Pipeline: User confirmations
 pipeline_confirmations:
   file_write_prompt: |
     Write to {path} ({len_content} chars)?
@@ -180,7 +212,6 @@ pipeline_confirmations:
   file_edit_prompt: |
     Edit {path}:
 
-# ── Pipeline: Status messages
 pipeline_status:
   pinging_host: "[info]Pinging {host}...[/info]"
   starting_slurm: "[info]Starting Slurm session '{name}'...[/info]"
@@ -188,22 +219,17 @@ pipeline_status:
   no_existing_job: "[info]No existing Slurm job for '{name}'; submitting fresh.[/info]"
   provider_ready: "[info]Provider '{provider}' -> {url} (job {job_id}, gpu {gpu})[/info]"
 
-# ── Pipeline: Tool rejected by user
 pipeline_tool_rejected:
   message: |
     The user rejected this action. Do not call any more tools.
     Instead, ask the user what they would like you to do differently.
     You may suggest an alternative approach.
 
-# ── Pipeline: Tool skipped (a prior tool in the same batch was rejected)
 pipeline_tool_skipped:
   message: |
     Skipped: an earlier tool call in this batch was rejected by the user, so
     this call was not run. Wait for the users instructions before retrying.
 
-# ── Snippets: shared prompt fragments. Reference one anywhere in any prompt
-# (typed or aliased) with {{name}}; it is replaced by the snippet text before
-# the prompt is sent. Unknown {{names}} are left untouched.
 snippets:
   commit_rules: |
     - It must be <80 chars
@@ -219,12 +245,6 @@ snippets:
     - If no ticket is provided and the branch does not contain the ticket name, determine which of the last 5 commits below is most similar to the work being committed. Copy ONLY the ticket tag (e.g. '(#25)') from that commit — NEVER copy any commit message text. If none are similar output no commit tag.
     - The commit message must describe the changes in your own words and must not be identical to any previous commit message
 
-# ── Aliases: canned prompts, invoked as /<token> or --<token>. Add any number;
-# each key becomes a command/flag named after it. A value is the prompt text
-# itself, or a mapping with `prompt` and an optional `help` line for /help and
-# --help. Any text typed after the token is pasted at the bottom of the prompt.
-# Any prompt (typed or aliased) may embed !`command` — the command runs before
-# the prompt is sent and its output is inlined in place of the token.
 aliases:
   qcm:
     help: Quick commit message generated from the current git diff.
