@@ -17,6 +17,12 @@ auto_approve: false
 max_iterations: 100
 max_bash_output: 30000
 max_file_read: 50000
+# Backstop cap (chars) on EVERY tool result before it enters the conversation,
+# so an unbounded search (e.g. file_grep with a broad pattern matching thousands
+# of lines) cannot overflow the context and fail the turn. bash_run and
+# file_read have their own tighter limits and truncate first; this catches the
+# rest and hints the model to narrow the query (see pipeline_tool_errors.output_truncated).
+max_tool_output: 50000
 trim_trailing_whitespace: true
 verbose: false
 
@@ -196,6 +202,8 @@ pipeline_tool_errors:
     Error: file_read was NOT run. {path} is {len_content} chars, which exceeds the limit of {max_limit}. Retry using bash_run with 'sed -n START,ENDp {path}' to read a specific line range, or 'grep PATTERN {path}' to search for text.
   file_read_error: |
     Error reading file: {error}
+  output_truncated: |
+    [Output truncated at {max_limit} chars — the tool returned too much to include in full. If this was a search (file_grep/file_find), run it again with a narrower pattern, a specific path, or a glob filter so it returns fewer results. Do not retry the same broad query; refine it first.]
   file_write_error: |
     Error writing file: {error}
   file_edit_multiple_matches: |

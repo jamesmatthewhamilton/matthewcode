@@ -250,6 +250,7 @@ def _providers_help_text():
     return catalog.format(title="providers")
 MAX_BASH_OUTPUT = CONFIG.get("max_bash_output", 30_000)
 MAX_FILE_READ = CONFIG.get("max_file_read", 50_000)
+MAX_TOOL_OUTPUT = CONFIG.get("max_tool_output", 50_000)
 TRIM_TRAILING_WHITESPACE = CONFIG.get("trim_trailing_whitespace", True)
 
 
@@ -859,10 +860,23 @@ def tool_find_build_env(path="."):
     return "\n".join(output)
 
 
+def _cap_tool_output(result):
+    """Backstop cap applied to EVERY tool result before it reaches the model: an
+    unbounded search (file_grep on a broad pattern, file_find in a huge tree) can
+    return enough text to overflow the context and fail the turn. Truncate to
+    MAX_TOOL_OUTPUT and append a hint to narrow the query. Tools with their own
+    tighter limit (bash_run, file_read) truncate first and stay under this, so
+    they keep their tool-specific message; this only catches the rest."""
+    if not isinstance(result, str) or len(result) <= MAX_TOOL_OUTPUT:
+        return result
+    hint = get_prompt("pipeline_tool_errors", "output_truncated", max_limit=MAX_TOOL_OUTPUT)
+    return result[:MAX_TOOL_OUTPUT] + "\n" + hint
+
+
 def _safe(name, fn):
     def call(a):
         try:
-            return fn(a)
+            return _cap_tool_output(fn(a))
         except KeyError as e:
             return f"Error: Tool call {name} is missing required argument {e}. Retry with the argument included."
     return call
@@ -1073,6 +1087,24 @@ def _tool_summary(name, args):
     if name == "file_find": return args.get("pattern", "?")
     if name == "file_grep": return args.get("pattern", "?")
     return str(args)
+
+
+def _log_tool_call(name, args, *, interactive, verbose):
+    """Announce a tool call in the log. bash_run always prints its FULL command
+    on its own unstyled line — however long — so it can be double-clicked/
+    selected and copied verbatim; other tools get the compact one-line summary.
+    Interactive output goes to stdout (dimmed); non-interactive goes to stderr so
+    it never mixes into --prompt's result on stdout."""
+    stream = None if interactive else sys.stderr
+    dim, reset = (DIM, RESET) if interactive else ("", "")
+    if interactive and verbose:
+        print(f"{dim}[tool: {name}({json.dumps(args, indent=2)})]{reset}", file=stream)
+    elif name == "bash_run":
+        tty = " (tty)" if _as_bool(args.get("tty")) else ""
+        print(f"{dim}[bash_run{tty}]{reset}", file=stream)
+        print(args.get("command", ""), file=stream)  # plain + own line = easy copy
+    else:
+        print(f"{dim}[{name}: {_tool_summary(name, args)}]{reset}", file=stream)
 
 
 # --- Command registry ---------------------------------------------------------
@@ -1636,13 +1668,7 @@ def _execute_tool_calls(calls, ctx, detector, *, interactive, assistant_content)
     })
     for i, (name, args) in enumerate(calls):
         call_id = f"call_{i}"
-        if interactive:
-            if ctx.args.verbose:
-                print(f"{DIM}[tool: {name}({json.dumps(args, indent=2)})]{RESET}")
-            else:
-                print(f"{DIM}[{name}: {_tool_summary(name, args)}]{RESET}")
-        else:
-            print(f"[{name}: {_tool_summary(name, args)}]", file=sys.stderr)
+        _log_tool_call(name, args, interactive=interactive, verbose=ctx.args.verbose)
 
         # Tool-safety confirmation is interactive-only — non-interactive (--prompt)
         # has no TTY to confirm at, so it auto-executes (caller opted in via --prompt).
