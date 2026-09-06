@@ -1,0 +1,14 @@
+[
+  {
+    "min_seconds": 0,
+    "words": ["pondering", "mulling", "considering", "reflecting"]
+  },
+  {
+    "min_seconds": 15,
+    "words": ["deliberating", "reasoning", "analyzing"]
+  },
+  {
+    "min_seconds": 45,
+    "words": ["contemplating", "cogitating", "ruminating"]
+  }
+]
