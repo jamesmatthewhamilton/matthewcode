@@ -24,6 +24,27 @@ restricted_bash_commands:
   - rm
   - curl
 
+# bash_run commands matching any of these regexes run inside a pseudo-terminal
+# automatically. Keyed on the tty flag (-t/--tty): docker's "input device is
+# not a TTY" error fires for -t, not -i alone.
+tty_commands:
+  - '\bdocker\b.*\b(?:run|exec)\b.*\s-[a-zA-Z]*t[a-zA-Z]*(?=\s|$)'
+  - '\bdocker\b.*\b(?:run|exec)\b.*\s--tty\b'
+  - '\bssh\b.*\s-[a-zA-Z]*t[a-zA-Z]*(?=\s|$)'
+
+# case-insensitive: when a non-tty run exits non-zero and its output matches
+# one of these, the tty_required hint is appended to the result
+tty_error_patterns:
+  - 'the input device is not a TTY'
+  - 'not a tty\b'
+  - 'not a terminal'
+  - 'must be run from a terminal'
+
+# re-run a failed command in a pseudo-terminal automatically when its output
+# matches tty_error_patterns. Off: a re-run repeats side effects the command
+# performed before it failed.
+tty_auto_retry: false
+
 loop_detection:
   enabled: true
   consecutive_threshold: 2
@@ -189,6 +210,8 @@ pipeline_tool_errors:
     Error: Command timed out. This may be because it opened an interactive prompt (like vim) or is waiting for input. Try using a non-interactive version of the command.
   bash_error: |
     Error: {error}
+  tty_required: |
+    Hint: the command failed because it requires a terminal. Retry the same bash_run call with tty=true to run it inside a pseudo-terminal.
   directory_not_found: |
     Error: Directory not found: {path}
   unknown_tool: |
@@ -211,6 +234,10 @@ pipeline_confirmations:
     (file exists, will be overwritten)
   file_edit_prompt: |
     Edit {path}:
+  bash_run_prompt: |
+    Run: {command}
+  bash_run_tty_prompt: |
+    Run (tty): {command}
 
 pipeline_status:
   pinging_host: "[info]Pinging {host}...[/info]"

@@ -3,13 +3,19 @@
 
 import argparse
 import difflib
+import errno
+import fcntl
 import fnmatch
 import json
 import os
 import re
+import select
+import signal
+import struct
 import subprocess
 import sys
 import random
+import termios
 import time
 
 # Add llm-connections/python to path. The optional slurm-manipulator nested
@@ -354,13 +360,18 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "bash_run",
-            "description": "Execute a non-interactive shell command and return its stdout and stderr. "
-            "stdin is closed. Commands requiring user input will receive EOF and fail.",
+            "description": "Execute a shell command and return its output. By default stdin is "
+            "closed, so commands needing input get EOF. Set tty=true to run inside a "
+            "pseudo-terminal for commands that insist on a terminal (e.g. scripts wrapping "
+            "`docker run -it`, `ssh -t`); in tty mode stdout and stderr are merged and no "
+            "input is supplied, so a command that truly waits for a keypress times out.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "The shell command to execute"},
                     "timeout": {"type": "integer", "description": "Timeout in seconds (default 120)"},
+                    "tty": {"type": "boolean", "description": "Run inside a pseudo-terminal (default false). "
+                            "Use after a command fails with 'the input device is not a TTY' or similar."},
                 },
                 "required": ["command"],
             },
@@ -458,6 +469,25 @@ def is_restricted_bash(name: str, args: dict) -> bool:
     return False
 
 
+def needs_tty(command: str) -> bool:
+    """True if a bash_run command matches a tty_commands regex (config), so it
+    runs inside a pseudo-terminal without the model asking for one."""
+    return any(re.search(p, command) for p in CONFIG.get("tty_commands", []))
+
+
+def _looks_like_tty_error(output: str) -> bool:
+    """True if a failed command's output matches a tty_error_patterns regex."""
+    return any(re.search(p, output, re.I) for p in CONFIG.get("tty_error_patterns", []))
+
+
+def _as_bool(value) -> bool:
+    """Coerce a model-supplied boolean: dispatch has no type layer, so a model
+    that emits the string "true" must still count as true."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
+
+
 # --- Tool implementations ---
 
 
@@ -528,39 +558,143 @@ def tool_file_edit(path, old_text, new_text):
         return get_prompt("pipeline_tool_errors", "file_edit_error", error=e)
 
 
-def tool_bash_run(command, timeout=120):
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
+
+
+def _kill_group(proc):
+    """Kill everything a shell=True command spawned: with start_new_session the
+    child leads its own session, so killpg reaches its descendants too. Fully
+    best-effort — this is cleanup before a TimeoutExpired is raised, and closing
+    the pty master just before this can already be tearing the child down (a
+    race that surfaces as EPERM/ESRCH), so no kill error may escape. Always reap."""
+    for kill in (lambda: os.killpg(os.getpgid(proc.pid), signal.SIGKILL), proc.kill):
+        try:
+            kill()
+            break
+        except OSError:
+            continue
     try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def _run_piped(command, timeout):
+    """Default executor: stdin closed, stdout/stderr captured through pipes and
+    concatenated (stdout first). Kills the child and re-raises on timeout."""
+    proc = subprocess.Popen(
+        command, shell=True,
+        stdin=subprocess.DEVNULL,  # no interactive input — EOF immediately
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,    # own process group, so a timeout reaps children too
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)          # not just the shell — its backgrounded children as well
+        raise
+    output = ""
+    if stdout:
+        output += stdout
+    if stderr:
+        output += ("\n" if output else "") + stderr
+    return output, proc.returncode
+
+
+def _run_in_pty(command, timeout):
+    """Executor for commands that insist on a terminal (docker run -it, ssh -t):
+    the child gets a pseudo-terminal on all three fds so isatty() is true and
+    we read the master side. stdout/stderr arrive merged and interleaved. No
+    input is ever written, so a command that truly waits for a key runs until
+    the deadline and is then killed."""
+    master, slave = os.openpty()
+    try:
+        # a 0x0 window breaks programs that measure columns (docker forwards it)
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 200, 0, 0))
         proc = subprocess.Popen(
             command, shell=True,
-            stdin=subprocess.DEVNULL,  # no interactive input — EOF immediately
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            stdin=slave, stdout=slave, stderr=slave,
+            close_fds=True, start_new_session=True,
+            env={**os.environ, "TERM": "dumb"},  # curbs terminfo-driven decoration
         )
+    except BaseException:  # a failed spawn must not leak the pty fd pair
+        os.close(master)
+        os.close(slave)
+        raise
+    os.close(slave)  # parent must drop the slave or EOF never arrives
+    chunks = []
+    deadline = time.monotonic() + timeout
+    timed_out = False
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                timed_out = True
+                break
+            try:
+                data = os.read(master, 65536)
+            except OSError as e:
+                if e.errno == errno.EIO:  # linux signals child exit this way
+                    break
+                raise
+            if not data:  # macOS signals it with plain EOF
+                break
+            chunks.append(data)
+    finally:
+        os.close(master)
+    if timed_out:
+        _kill_group(proc)
+        raise subprocess.TimeoutExpired(command, timeout)
+    try:
+        proc.wait(timeout=max(deadline - time.monotonic(), 1))
+    except subprocess.TimeoutExpired:  # closed the pty but kept running
+        _kill_group(proc)
+        raise
+    # decode once so a multibyte char split across reads survives
+    output = b"".join(chunks).decode("utf-8", errors="replace")
+    output = ANSI_RE.sub("", output)
+    output = re.sub(r"\r+\n", "\n", output)  # pty ONLCR: \n -> \r\n, \r\n -> \r\r\n
+    output = output.replace("\r", "\n")      # lone CR (progress bars) -> line break
+    return output, proc.returncode
+
+
+def _format_bash_result(output, rc):
+    # Truncate the command's own output first so the exit-code marker below
+    # is never cut off.
+    if len(output) > MAX_BASH_OUTPUT:
+        output = output[:MAX_BASH_OUTPUT] + f"\n[truncated at {MAX_BASH_OUTPUT} chars]"
+    if not output:
+        # Give silent success an explicit signal so the model doesn't
+        # misread it as failure and re-probe in a loop.
+        return ("(no output, exit 0 — command succeeded)" if rc == 0
+                else f"(no output)\n[exit code: {rc}]")
+    return output + f"\n[exit code: {rc}]"
+
+
+def tool_bash_run(command, timeout=120, tty=False):
+    """Run a shell command. `tty` (or a tty_commands match) swaps the piped
+    executor for a pseudo-terminal one. A non-tty failure that looks like a
+    TTY complaint gets the tty_required hint appended — or, with
+    tty_auto_retry on, is re-run under a pty straight away."""
+    use_tty = tty or needs_tty(command)
+    try:
         try:
-            stdout, stderr = proc.communicate(timeout=timeout)
+            output, rc = (_run_in_pty if use_tty else _run_piped)(command, timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
             return get_prompt("pipeline_tool_errors", "bash_timeout")
-        output = ""
-        if stdout:
-            output += stdout
-        if stderr:
-            output += ("\n" if output else "") + stderr
-        rc = proc.returncode
-        # Truncate the command's own output first so the exit-code marker below
-        # is never cut off.
-        if len(output) > MAX_BASH_OUTPUT:
-            output = output[:MAX_BASH_OUTPUT] + f"\n[truncated at {MAX_BASH_OUTPUT} chars]"
-        if not output:
-            # Give silent success an explicit signal so the model doesn't
-            # misread it as failure and re-probe in a loop.
-            output = ("(no output, exit 0 — command succeeded)" if rc == 0
-                      else f"(no output)\n[exit code: {rc}]")
-        else:
-            output += f"\n[exit code: {rc}]"
-        return output
+        result = _format_bash_result(output, rc)
+        if rc != 0 and not use_tty and _looks_like_tty_error(output):
+            # Auto-retry must not silently re-run a restricted command under a
+            # pty — that would sidestep the approval gate the caller applied.
+            # Those fall through to the hint, so the model re-issues with
+            # tty=true and passes through confirmation normally.
+            if CONFIG.get("tty_auto_retry", False) and not is_restricted_bash(
+                    "bash_run", {"command": command}):
+                return tool_bash_run(command, timeout, tty=True)  # bounded: use_tty next pass
+            result += "\n" + get_prompt("pipeline_tool_errors", "tty_required").rstrip("\n")
+        return result
     except Exception as e:
         return get_prompt("pipeline_tool_errors", "bash_error", error=e)
 
@@ -738,7 +872,8 @@ TOOL_DISPATCH = {
     "file_read": _safe("file_read", lambda a: tool_file_read(a["path"])),
     "file_write": _safe("file_write", lambda a: tool_file_write(a["path"], a["content"])),
     "file_edit": _safe("file_edit", lambda a: tool_file_edit(a["path"], a["old_text"], a["new_text"])),
-    "bash_run": _safe("bash_run", lambda a: tool_bash_run(a["command"], a.get("timeout", 120))),
+    "bash_run": _safe("bash_run", lambda a: tool_bash_run(a["command"], a.get("timeout", 120),
+                                                          _as_bool(a.get("tty", False)))),
     "dir_list": _safe("dir_list", lambda a: tool_dir_list(a.get("path", "."))),
     "file_find": _safe("file_find", lambda a: tool_file_find(a["pattern"], a.get("path", "."))),
     "file_grep": _safe("file_grep", lambda a: tool_file_grep(a["pattern"], a.get("path", "."), a.get("glob"))),
@@ -784,7 +919,9 @@ def confirm_tool(name, args, restricted=False):
             else:
                 print(f"  {line.rstrip()}")
     elif name == "bash_run":
-        print(f"\n{YELLOW}Run: {args.get('command', '?')}{RESET}")
+        cmd = args.get("command", "?")
+        key = "bash_run_tty_prompt" if (_as_bool(args.get("tty")) or needs_tty(cmd)) else "bash_run_prompt"
+        print(f"\n{YELLOW}{get_prompt('pipeline_confirmations', key, command=cmd).rstrip()}{RESET}")
     if restricted:
         print(f"{RED}Restricted command — approval required even with --yes.{RESET}")
         return _ask_yes_no("Run anyway? [y/N] ", default_yes=False)
@@ -930,7 +1067,8 @@ def _tool_summary(name, args):
     if name == "file_edit": return args.get("path", "?")
     if name == "bash_run":
         cmd = args.get("command", "?")
-        return cmd if len(cmd) < 60 else cmd[:57] + "..."
+        prefix = "(tty) " if _as_bool(args.get("tty")) else ""
+        return prefix + (cmd if len(cmd) < 60 else cmd[:57] + "...")
     if name == "dir_list": return args.get("path", ".")
     if name == "file_find": return args.get("pattern", "?")
     if name == "file_grep": return args.get("pattern", "?")
