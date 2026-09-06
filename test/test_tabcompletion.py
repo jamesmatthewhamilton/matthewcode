@@ -1,11 +1,11 @@
-"""Unit tests for the REPL slash-command completer (res/tabcompletion.py).
+"""Unit tests for the REPL slash-command completer (src/tabcompletion.py).
 
 Drives the completer with constructed prompt_toolkit Documents — no TTY needed.
 """
 
 from prompt_toolkit.document import Document
 
-from res.tabcompletion import build_slash_completer
+from src.tabcompletion import build_slash_completer
 
 
 def _complete(completer, text):

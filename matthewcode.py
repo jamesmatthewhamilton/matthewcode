@@ -26,9 +26,7 @@ for _slurm_path in (
         break
 
 from llm_connections import LLMConnection, ProviderCatalog
-from res.thinking import WORDS as THINKING_WORDS
-from res.thinking import QUOTES as THINKING_QUOTES
-from res.loop_detection import LoopDetector
+from src.loop_detection import LoopDetector
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.theme import Theme
@@ -36,7 +34,7 @@ from prompt_toolkit import prompt as pt_prompt
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.shortcuts import CompleteStyle
-from res.tabcompletion import build_slash_completer
+from src.tabcompletion import build_slash_completer
 
 console = Console(theme=Theme({
     "info": "dim",
@@ -68,6 +66,8 @@ def render_markdown(text: str):
 
 HISTORY_DIR = os.path.expanduser("~/.matthewcode")
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "config", "config.yaml")
+QUOTES_FILE = os.path.join(SCRIPT_DIR, "config", "quotes.json")
+THINKING_FILE = os.path.join(SCRIPT_DIR, "config", "thinking.json")
 
 SESSION_DIR_KEY = os.getcwd()  # directory matthewcode was launched in
 
@@ -103,6 +103,54 @@ def load_config() -> dict:
 
 
 CONFIG = load_config()
+
+
+def load_quotes() -> list:
+    """Load config/quotes.json: a list of records, each with a `text` map keyed
+    by language code (always including 'en'), plus `author` and the optional
+    `original` (which language key is the source text) and `source`. Keyed by
+    language rather than a field per language so adding a language is just
+    another key — no schema or consumer change."""
+    with open(QUOTES_FILE, "r") as f:
+        return json.load(f)
+
+
+def format_quote(quote: dict) -> str:
+    """Render one quote record for display: source-language line (when it isn't
+    English), then the English, then the attribution. Absent optional fields
+    just drop their line, so a bare {text: {en}, author} record renders too."""
+    original = quote.get("original", "en")
+    lines = [quote["text"][original]]
+    if original != "en":
+        lines.append(quote["text"]["en"])
+    attribution = f"— {quote['author']}"
+    if quote.get("source"):
+        attribution += f", {quote['source']}"
+    lines.append(attribution)
+    return "\n".join(lines)
+
+
+def load_thinking_tiers() -> list:
+    """Load config/thinking.json: spinner vocabulary layered by how long the
+    turn has been running. Each tier carries its own `min_seconds` threshold, so
+    adding or retiming a tier is a data edit — no tier name is known to code."""
+    with open(THINKING_FILE, "r") as f:
+        return sorted(json.load(f), key=lambda tier: tier["min_seconds"])
+
+
+def thinking_word(elapsed: float) -> str:
+    """Pick a spinner word for a turn that has run `elapsed` seconds: the last
+    tier whose threshold has been passed, so the vocabulary intensifies as the
+    turn drags on and the word itself reports progress."""
+    tier = THINKING_TIERS[0]
+    for candidate in THINKING_TIERS:
+        if elapsed >= candidate["min_seconds"]:
+            tier = candidate
+    return random.choice(tier["words"])
+
+
+QUOTES = load_quotes()
+THINKING_TIERS = load_thinking_tiers()
 
 
 def _resolve_slurm_sessions(yaml_path: str, provider_filter: str = None) -> str:
@@ -1504,8 +1552,8 @@ def run_agent_loop(ctx, *, interactive):
     max_iters = CONFIG.get("max_iterations", 10)
     # Occasionally (not every turn) drop a Stoic quote right after the prompt — only
     # interactive, so it never pollutes --prompt's stdout. Gold, 20% of the time.
-    if interactive and THINKING_QUOTES and random.random() < 0.20:
-        print(f"\n{YELLOW}{random.choice(THINKING_QUOTES)}{RESET}\n")
+    if interactive and QUOTES and random.random() < 0.20:
+        print(f"\n{YELLOW}{format_quote(random.choice(QUOTES))}{RESET}\n")
     detector = make_loop_detector()
     for _iter in range(max_iters):
         try:
@@ -1518,7 +1566,7 @@ def run_agent_loop(ctx, *, interactive):
             if interactive:
                 llama_frames = ["🦙      ", "  🦙    ", "    🦙  "]
                 bubble_frames = ["·", "∘", "○", "◎", "◉", "◎", "○", "∘"]
-                thinking_word = random.choice(THINKING_WORDS)
+                spinner_word = thinking_word(0)
                 next_word_change = time.time() + random.uniform(5, 20)
                 start_time = time.time()
                 frame_idx = 0
@@ -1532,11 +1580,11 @@ def run_agent_loop(ctx, *, interactive):
                             frame = llama_frames[frame_idx % len(llama_frames)]
                             bubble = bubble_frames[int(time.time() - start_time) % len(bubble_frames)]
                             elapsed = int(time.time() - start_time)
-                            sys.stdout.write(f"\r{frame}{bubble} {thinking_word}... ({elapsed}s, {chunk_count} tokens)   ")
+                            sys.stdout.write(f"\r{frame}{bubble} {spinner_word}... ({elapsed}s, {chunk_count} tokens)   ")
                             sys.stdout.flush()
                             frame_idx += 1
                             if time.time() >= next_word_change:
-                                thinking_word = random.choice(THINKING_WORDS)
+                                spinner_word = thinking_word(elapsed)
                                 next_word_change = time.time() + random.uniform(5, 20)
                 if chunk.tool_calls:
                     tool_calls.extend(chunk.tool_calls)
