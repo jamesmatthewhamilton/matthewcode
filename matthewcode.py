@@ -249,8 +249,12 @@ def _providers_help_text():
     catalog = ProviderCatalog.from_paths(paths)
     return catalog.format(title="providers")
 MAX_BASH_OUTPUT = CONFIG.get("max_bash_output", 30_000)
+BASH_SUCCESS_TAIL = CONFIG.get("bash_success_tail", 2_000)
+BASH_FAILURE_HEAD = CONFIG.get("bash_failure_head", 5_000)
+BASH_LOG_FILE = os.path.join(HISTORY_DIR, "logs", "last_bash.log")
 MAX_FILE_READ = CONFIG.get("max_file_read", 50_000)
 MAX_TOOL_OUTPUT = CONFIG.get("max_tool_output", 50_000)
+MAX_SEARCH_RESULTS = CONFIG.get("max_search_results", 25)
 TRIM_TRAILING_WHITESPACE = CONFIG.get("trim_trailing_whitespace", True)
 
 
@@ -314,7 +318,8 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "file_read",
-            "description": "Read the contents of a file.",
+            "description": "Read the contents of a file. Files over the size limit are refused; read those "
+            "in line ranges with bash_run (sed -n START,ENDp) instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -366,7 +371,9 @@ TOOLS = [
             "pseudo-terminal for commands that insist on a terminal (e.g. scripts wrapping "
             "`docker run -it`, `ssh -t`); in tty mode stdout and stderr are merged and no "
             "input is supplied, so a command that truly waits for a keypress times out. "
-            "Every result ends with `[exit code: N]`; non-zero means the command failed.",
+            "Every result ends with `[exit code: N]`; non-zero means the command failed. "
+            "Long output is trimmed: a successful command shows only its tail, a failed one "
+            "its head and tail; the full output is saved to a log file named in the result.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -399,7 +406,8 @@ TOOLS = [
         "function": {
             "name": "file_find",
             "description": "Recursively search for files matching a pattern (like 'main.cpp' or '*.py'). "
-            "Use this to locate files in a project before reading or building them.",
+            "Use this to locate files in a project before reading or building them. Stops after "
+            f"{MAX_SEARCH_RESULTS} matches, so give a specific path and pattern.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -415,7 +423,8 @@ TOOLS = [
         "function": {
             "name": "file_grep",
             "description": "Search for a text pattern inside files. Returns matching lines with file paths. "
-            "Use this to find where functions, classes, or variables are defined.",
+            "Use this to find where functions, classes, or variables are defined. Stops after "
+            f"{MAX_SEARCH_RESULTS} matches, so give a specific path, pattern, and file glob.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -663,11 +672,65 @@ def _run_in_pty(command, timeout):
     return output, proc.returncode
 
 
-def _format_bash_result(output, rc):
-    # Truncate the command's own output first so the exit-code marker below
-    # is never cut off.
-    if len(output) > MAX_BASH_OUTPUT:
-        output = output[:MAX_BASH_OUTPUT] + f"\n[truncated at {MAX_BASH_OUTPUT} chars]"
+def _save_bash_log(command, output, rc):
+    """Write the full, untrimmed output of the last bash_run to BASH_LOG_FILE so
+    whatever _trim_bash_output drops from the model's view stays on disk."""
+    try:
+        os.makedirs(os.path.dirname(BASH_LOG_FILE), exist_ok=True)
+        with open(BASH_LOG_FILE, "w") as f:
+            f.write(f"$ {command}\n{output.rstrip(chr(10))}\n[exit code: {rc}]\n")
+    except OSError:
+        pass  # logging is best-effort; never fail the tool call over it
+
+
+def _scan_omitted(region, first_log_line):
+    """Pull error/warning-looking lines out of the omitted middle of a failed
+    command's output (see bash_omitted_scan in config). Each line is tagged
+    with its line number in BASH_LOG_FILE so the model can read around it."""
+    cfg = CONFIG.get("bash_omitted_scan") or {}
+    patterns = [re.compile(p, re.I) for p in cfg.get("patterns", [])]
+    if not patterns:
+        return ""
+    hits = [(first_log_line + i, line) for i, line in enumerate(region.splitlines())
+            if any(p.search(line) for p in patterns)]
+    if not hits:
+        return ""
+    shown = hits[:cfg.get("max_lines", 40)]
+    begin = get_prompt("pipeline_tool_errors", "bash_omitted_matches_begin",
+                       shown=len(shown), total=len(hits), log_path=BASH_LOG_FILE).rstrip("\n")
+    end = get_prompt("pipeline_tool_errors", "bash_omitted_matches_end").rstrip("\n")
+    return "\n".join([begin] + [f"  L{n}: {line}" for n, line in shown] + [end]) + "\n"
+
+
+def _trim_bash_output(output, rc):
+    """Cut long output by exit status. A successful command keeps only its tail
+    (a passing build's log is noise); a failed one keeps a head slice plus the
+    tail, because compilers and test runners put the reason at the end. Cuts
+    snap to line boundaries so the model never sees a torn line."""
+    head, limit = (0, BASH_SUCCESS_TAIL) if rc == 0 else (BASH_FAILURE_HEAD, MAX_BASH_OUTPUT)
+    if len(output) <= limit:
+        return output
+    tail = limit - head
+    head_part = output[:head]
+    head_part = head_part[:head_part.rfind("\n") + 1] if head_part else ""
+    tail_part = output[-tail:]
+    tail_part = tail_part[tail_part.find("\n") + 1:]
+    omitted = len(output) - len(head_part) - len(tail_part)
+    marker = get_prompt("pipeline_tool_errors", "bash_output_omitted",
+                        omitted=omitted, log_path=BASH_LOG_FILE).rstrip("\n")
+    scan = ""
+    if rc != 0:
+        # log line 1 is the "$ command" header, so output line k is log line k+1
+        region = output[len(head_part):len(output) - len(tail_part)]
+        scan = _scan_omitted(region, first_log_line=head_part.count("\n") + 2)
+    return head_part + marker + "\n" + scan + tail_part
+
+
+def _format_bash_result(output, rc, command=""):
+    _save_bash_log(command, output, rc)
+    # Trim the command's own output first so the exit-code marker below is
+    # never cut off.
+    output = _trim_bash_output(output, rc)
     if not output:
         # Give silent success an explicit signal so the model doesn't
         # misread it as failure and re-probe in a loop.
@@ -688,7 +751,7 @@ def tool_bash_run(command, timeout=120, tty=False):
             output, rc = (_run_in_pty if use_tty else _run_piped)(command, timeout)
         except subprocess.TimeoutExpired:
             return get_prompt("pipeline_tool_errors", "bash_timeout")
-        result = _format_bash_result(output, rc)
+        result = _format_bash_result(output, rc, command)
         if rc != 0 and not use_tty and _looks_like_tty_error(output):
             # Auto-retry must not silently re-run a restricted command under a
             # pty — that would sidestep the approval gate the caller applied.
@@ -731,8 +794,8 @@ def tool_file_find(pattern, path="."):
         for f in files:
             if fnmatch.fnmatch(f, pattern):
                 matches.append(os.path.join(root, f))
-                if len(matches) >= 50:
-                    return "\n".join(matches) + "\n[truncated at 50 results]"
+                if len(matches) >= MAX_SEARCH_RESULTS:
+                    return "\n".join(matches) + "\n" + get_prompt("pipeline_tool_errors", "search_truncated", max_results=MAX_SEARCH_RESULTS).rstrip("\n")
     return "\n".join(matches) if matches else get_prompt("pipeline_tool_success", "find_no_matches", pattern=pattern, path=path)
 
 
@@ -757,8 +820,8 @@ def tool_file_grep(pattern, path=".", file_glob=None):
                 for i, line in enumerate(fh, 1):
                     if regex.search(line):
                         matches.append(f"{fpath}:{i}: {line.rstrip()}")
-                        if len(matches) >= 50:
-                            return "\n".join(matches) + "\n[truncated at 50 results]"
+                        if len(matches) >= MAX_SEARCH_RESULTS:
+                            return "\n".join(matches) + "\n" + get_prompt("pipeline_tool_errors", "search_truncated", max_results=MAX_SEARCH_RESULTS).rstrip("\n")
         except (OSError, UnicodeDecodeError):
             continue
     return "\n".join(matches) if matches else get_prompt("pipeline_tool_success", "grep_no_matches", pattern=pattern, path=path)

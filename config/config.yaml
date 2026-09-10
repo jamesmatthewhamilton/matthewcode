@@ -15,14 +15,48 @@
 
 auto_approve: false
 max_iterations: 100
-max_bash_output: 30000
-max_file_read: 50000
+max_bash_output: 12000
+# bash_run output is trimmed by exit status. Exit 0: keep only the last
+# bash_success_tail chars (a passing build's log is noise). Non-zero: keep the
+# first bash_failure_head chars plus the tail up to max_bash_output, so the
+# error at the end of a long build log is never cut off. The full output is
+# always written to ~/.matthewcode/logs/last_bash.log for file_grep/file_read.
+bash_success_tail: 1000
+bash_failure_head: 1500
+# When a FAILED bash_run had its middle omitted, lines in the omitted region
+# matching these regexes (case-insensitive) are pulled into the result, capped
+# at max_lines, so the first real error of a long build isn't lost behind the
+# cascade at the tail. Never runs on exit 0 or on output that wasn't trimmed.
+# An empty patterns list disables it.
+bash_omitted_scan:
+  patterns:
+    - '\berror\b'
+    - '\bwarning\b'
+    - '\bfailed\b'
+    - '\bfatal\b'
+    - '\bcould not\b'
+    - '\bcannot\b'
+    - '\bno such file\b'
+    - '\bnot found\b'
+    - '\bpermission denied\b'
+    - '\bundefined reference\b'
+    - '\bsegmentation fault\b'
+    - '\btraceback\b'
+    - '\bexception\b'
+    - '\baborted?\b'
+    - '\*\*\*'                 # make's error prefix: make: *** [target] Error 1
+    - '\bno rule to make target\b'
+  max_lines: 20
+max_file_read: 20000
+# file_find / file_grep stop after this many matches and tell the model to
+# narrow the search rather than page through a broad one.
+max_search_results: 25
 # Backstop cap (chars) on EVERY tool result before it enters the conversation,
 # so an unbounded search (e.g. file_grep with a broad pattern matching thousands
 # of lines) cannot overflow the context and fail the turn. bash_run and
 # file_read have their own tighter limits and truncate first; this catches the
 # rest and hints the model to narrow the query (see pipeline_tool_errors.output_truncated).
-max_tool_output: 50000
+max_tool_output: 16000
 trim_trailing_whitespace: true
 verbose: false
 
@@ -83,6 +117,7 @@ pipeline_main:
     Rules:
     - Rule Override: Any rule below may be overridden when the user explicitly requests a different approach
     - ALWAYS read a file before editing it
+    - Search narrowly: give file_grep/file_find a specific path and pattern, and read large files in line ranges, never whole
     - NEVER delete files
     - When an author name is needed use: 'Matthew Hamilton'
 
@@ -217,6 +252,14 @@ pipeline_tool_errors:
     Error: old_text not found in file. Read the file first to get exact text.
   file_edit_error: |
     Error editing file: {error}
+  search_truncated: |
+    [Stopped at {max_results} matches — there are more. This search is too broad: narrow the pattern, give a specific path, or add a file glob and run it again. Do not page through broad results.]
+  bash_output_omitted: |
+    [... {omitted} chars omitted; full output saved to {log_path}]
+  bash_omitted_matches_begin: |
+    [BEGIN picked lines: {shown} of {total} error-like lines pulled from the omitted middle. They are NOT contiguous and NOT adjacent to the output below. L = line number in {log_path}; read context with bash_run: sed -n 'START,ENDp' {log_path}]
+  bash_omitted_matches_end: |
+    [END picked lines — normal output resumes]
   bash_timeout: |
     Error: Command timed out. This may be because it opened an interactive prompt (like vim) or is waiting for input. Try using a non-interactive version of the command.
   bash_error: |
