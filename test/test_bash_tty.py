@@ -16,15 +16,23 @@ MOCK = "sh " + shlex.quote(os.path.join(m.SCRIPT_DIR, "test", "docker_run_tty.sh
 HELLO = "hello from container"
 
 
-def _hint():
-    return m.get_prompt("pipeline_tool_errors", "tty_required").rstrip()
+def _hint(command=MOCK):
+    return m.get_prompt("pipeline_tool_errors", "tty_required", command=command).rstrip()
 
 
-def test_plain_run_reports_tty_error_with_hint():
+def _no_auto_tty(monkeypatch):
+    # the default tty_commands now match docker-named wrappers (incl. the mock),
+    # so tests of the plain-run failure path must switch detection off
+    monkeypatch.setitem(m.CONFIG, "tty_commands", [])
+
+
+def test_plain_run_reports_tty_error_with_hint(monkeypatch):
+    _no_auto_tty(monkeypatch)
     out = m.tool_bash_run(MOCK)
     assert "the input device is not a TTY" in out
     assert "[exit code: 1]" in out
     assert _hint() in out
+    assert MOCK in out                      # the exact command, for verbatim reuse
     assert HELLO not in out
 
 
@@ -50,9 +58,9 @@ def test_tty_merges_stderr_and_keeps_exit_code():
 def test_needs_tty_patterns():
     yes = ["docker run -it img", "docker run -ti img", "docker run -i -t img",
            "docker exec --interactive --tty c sh", "docker run --rm -t img",
-           "ssh -t host cmd"]
+           "ssh -t host cmd", "./docker_run_tty.sh", "sh scripts/run-docker.sh --x11"]
     no = ["docker ps", "git status", "docker run -i img",
-          "docker run --rm img echo hi", "./docker_run_tty.sh"]
+          "docker run --rm img echo hi", "./build.sh", "./docker_run.py"]
     for cmd in yes:
         assert m.needs_tty(cmd), cmd
     for cmd in no:
@@ -79,6 +87,7 @@ def test_tty_output_normalized():
 
 
 def test_tty_auto_retry_config(monkeypatch):
+    _no_auto_tty(monkeypatch)               # force the plain run to fail first
     monkeypatch.setitem(m.CONFIG, "tty_auto_retry", True)
     out = m.tool_bash_run(MOCK)
     assert HELLO in out
@@ -145,7 +154,7 @@ def test_auto_retry_skips_restricted_command(monkeypatch):
     # a restricted (rm) command that fails with a TTY-shaped error
     cmd = "rm nonexistent; echo 'the input device is not a TTY' >&2; exit 1"
     out = m.tool_bash_run(cmd)
-    assert _hint() in out, "restricted command should get the hint, not an auto-retry"
+    assert _hint(cmd) in out, "restricted command should get the hint, not an auto-retry"
 
 
 def test_auto_retry_still_fires_for_unrestricted():

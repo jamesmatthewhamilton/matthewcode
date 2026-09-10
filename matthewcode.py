@@ -365,14 +365,16 @@ TOOLS = [
             "closed, so commands needing input get EOF. Set tty=true to run inside a "
             "pseudo-terminal for commands that insist on a terminal (e.g. scripts wrapping "
             "`docker run -it`, `ssh -t`); in tty mode stdout and stderr are merged and no "
-            "input is supplied, so a command that truly waits for a keypress times out.",
+            "input is supplied, so a command that truly waits for a keypress times out. "
+            "Every result ends with `[exit code: N]`; non-zero means the command failed.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "The shell command to execute"},
                     "timeout": {"type": "integer", "description": "Timeout in seconds (default 120)"},
                     "tty": {"type": "boolean", "description": "Run inside a pseudo-terminal (default false). "
-                            "Use after a command fails with 'the input device is not a TTY' or similar."},
+                            "Use after a command fails with 'the input device is not a TTY' or similar, "
+                            "re-sending the identical command string."},
                 },
                 "required": ["command"],
             },
@@ -670,8 +672,9 @@ def _format_bash_result(output, rc):
         # Give silent success an explicit signal so the model doesn't
         # misread it as failure and re-probe in a loop.
         return ("(no output, exit 0 — command succeeded)" if rc == 0
-                else f"(no output)\n[exit code: {rc}]")
-    return output + f"\n[exit code: {rc}]"
+                else f"(no output)\n[exit code: {rc}] COMMAND FAILED")
+    marker = f"[exit code: {rc}]" + ("" if rc == 0 else " COMMAND FAILED")
+    return output.rstrip("\n") + "\n" + marker
 
 
 def tool_bash_run(command, timeout=120, tty=False):
@@ -694,7 +697,7 @@ def tool_bash_run(command, timeout=120, tty=False):
             if CONFIG.get("tty_auto_retry", False) and not is_restricted_bash(
                     "bash_run", {"command": command}):
                 return tool_bash_run(command, timeout, tty=True)  # bounded: use_tty next pass
-            result += "\n" + get_prompt("pipeline_tool_errors", "tty_required").rstrip("\n")
+            result += "\n" + get_prompt("pipeline_tool_errors", "tty_required", command=command).rstrip("\n")
         return result
     except Exception as e:
         return get_prompt("pipeline_tool_errors", "bash_error", error=e)
